@@ -37,7 +37,7 @@
 
 流水线见 `.github/workflows/build.yml`：
 
-1. `setup-java` JDK 17 + `setup-gradle` Gradle 8.7（仓库里没有 wrapper）
+1. `setup-java` JDK 17 + `setup-gradle` Gradle 8.14.5（仓库里没有 wrapper）
 2. 从 `secrets.KEYSTORE_B64` 解出 keystore
 3. `gradle assembleRelease`（签名单元读 `KEYSTORE_FILE/PASSWORD/ALIAS/PASSWORD` 环境变量）
 4. `apksigner verify --print-certs` 校验签名
@@ -51,7 +51,7 @@
 ```bash
 cd autocloud
 # 用 Android Studio 打开，或先生成 wrapper：
-gradle wrapper --gradle-version 8.7
+gradle wrapper --gradle-version 8.14.5
 ./gradlew assembleRelease
 # 产物：app/build/outputs/apk/release/app-release.apk
 # 本地没设 KEYSTORE_FILE 时会自动用 debug 签名，可直接 assembleInstall
