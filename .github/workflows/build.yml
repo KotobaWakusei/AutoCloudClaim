@@ -16,7 +16,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 固定 runner：2026-10-19 起 ubuntu-latest 会切到 Ubuntu 26，可能改变预装 Android SDK
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
