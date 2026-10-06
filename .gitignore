@@ -1,0 +1,22 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 输出产物
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# 其他
+.DS_Store
+*.log
