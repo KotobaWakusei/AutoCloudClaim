@@ -25,12 +25,36 @@
 
 ## 构建
 
+### 方式 A：GitHub Actions（推荐）
+
+**每次 push 自动构建**：
+
+- **任意分支的任意提交** → 跑 CI，产物挂在该次 run 的 *Artifacts*（保留 30 天）
+- **push 到 `main`** → 额外创建一个 GitHub Release，tag 形如 `build-<run_number>`，
+  资产是签名好的 `AutoCloudClaim-build-<run_number>.apk`，标记为 latest
+
+直接下载：**[Releases](https://github.com/KotobaWakusei/AutoCloudClaim/releases)**
+
+流水线见 `.github/workflows/build.yml`：
+
+1. `setup-java` JDK 17 + `setup-gradle` Gradle 8.7（仓库里没有 wrapper）
+2. 从 `secrets.KEYSTORE_B64` 解出 keystore
+3. `gradle assembleRelease`（签名单元读 `KEYSTORE_FILE/PASSWORD/ALIAS/PASSWORD` 环境变量）
+4. `apksigner verify --print-certs` 校验签名
+5. `upload-artifact`（所有分支）→ `softprops/action-gh-release`（仅 `main`）
+
+需要的仓库 Secrets（已配置好）：`KEYSTORE_B64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`。
+仓库是 Public 的，Secrets 不会被 workflow 日志回显，fork 的 PR 拿不到。
+
+### 方式 B：本地
+
 ```bash
 cd autocloud
 # 用 Android Studio 打开，或先生成 wrapper：
 gradle wrapper --gradle-version 8.7
 ./gradlew assembleRelease
 # 产物：app/build/outputs/apk/release/app-release.apk
+# 本地没设 KEYSTORE_FILE 时会自动用 debug 签名，可直接 assembleInstall
 ```
 
 依赖：`compileOnly de.robv.android.xposed:api:82`（仓库 `https://api.xposed.info/`），
@@ -126,6 +150,7 @@ root 机可用 `su -c 'am broadcast …'`。状态在 LSPosed 日志里实时可
 
 ```
 autocloud/
+├── .github/workflows/build.yml               CI：每次 push 构建，main 发 Release
 ├── app/src/main/assets/xposed_init            模块入口类名
 ├── app/src/main/res/values/arrays.xml         xposed_scope = com.heytap.cloud
 ├── app/src/main/res/values[-night]/themes.xml Material 系统主题（配 edge-to-edge）

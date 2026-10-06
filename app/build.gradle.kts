@@ -16,9 +16,25 @@ android {
         versionName = "0.1.0"
     }
 
+    // CI 通过环境变量提供正式签名（GitHub Secrets）；本地没配时退回 debug 签名，保证能直接 assembleInstall
+    signingConfigs {
+        create("release") {
+            val ks = System.getenv("KEYSTORE_FILE")
+            if (ks != null) {
+                storeFile = file(ks)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig =
+                if (System.getenv("KEYSTORE_FILE") != null) signingConfigs.getByName("release")
+                else signingConfigs.getByName("debug")
         }
     }
 
