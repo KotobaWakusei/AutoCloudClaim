@@ -19,17 +19,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
 
       # 仓库里没有 gradle wrapper，这里固定 Gradle 版本
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "8.7"
 
@@ -55,7 +55,7 @@ jobs:
           ls -lh AutoCloudClaim-build-*.apk
 
       - name: Upload artifact (每个分支的每次 push)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: AutoCloudClaim-build-${{ github.run_number }}
           path: AutoCloudClaim-build-${{ github.run_number }}.apk
@@ -64,7 +64,7 @@ jobs:
 
       - name: Create GitHub Release (仅 main)
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ github.run_number }}
           name: AutoCloudClaim build ${{ github.run_number }}
