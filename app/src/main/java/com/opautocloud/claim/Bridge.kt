@@ -28,6 +28,14 @@ class Bridge(private val wv: WebView) {
     @JavascriptInterface fun autoUninstall(): Boolean = State.autoUninstall
     @JavascriptInterface fun dryRun(): Boolean = State.dryRun
 
+    /** 11.3.5 TaskWall SDK 最近一次 H5 结果的版本号。 */
+    @JavascriptInterface fun taskResultVersion(): Long = State.taskResultVersion
+    @JavascriptInterface fun taskResultCode(): Int = State.taskResultCode
+    @JavascriptInterface fun taskResultMessage(): String = State.taskResultMessage
+    @JavascriptInterface fun taskResultSkuId(): String = State.taskResultSkuId
+    @JavascriptInterface fun taskResultTraceId(): String = State.taskResultTraceId
+    @JavascriptInterface fun taskWallSuccessCode(): Int = State.TASKWALL_SUCCESS_CODE
+
     @JavascriptInterface
     fun log(msg: String) {
         XposedBridge.log("[AutoCloud][JS] " + msg)
