@@ -193,7 +193,7 @@ class MainHook : IXposedHookLoadPackage {
 
         runCatching {
             XposedHelpers.findAndHookMethod(
-                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute$a",
+                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute" + "$" + "a",
                 classLoader,
                 "a",
                 org.json.JSONObject::class.java,
