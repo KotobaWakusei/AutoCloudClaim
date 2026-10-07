@@ -19,7 +19,10 @@ object Script {
   var B = window.autocloud;
   if (!B) { return; }
 
-  var S = { run: false, started: 0, claimed: 0, idle: 0, busy: 0, lastT: 0, stop: '' };
+  var S = {
+    run: false, started: 0, claimed: 0, idle: 0, busy: 0,
+    lastT: 0, beforePkgs: '', newPkgs: '', stop: '', lastUrl: location.href
+  };
   window.__AC = S;
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -90,6 +93,20 @@ object Script {
 
   function scrollNext() { window.scrollBy(0, 360); }
 
+  function packageDiff(before) {
+    var now = B.installedPackages();
+    if (!now) return '';
+    var oldSet = {};
+    var a = String(before || '').split(',');
+    for (var i = 0; i < a.length; i++) if (a[i]) oldSet[a[i]] = true;
+    var out = [];
+    var b = now.split(',');
+    for (var j = 0; j < b.length; j++) {
+      if (b[j] && !oldSet[b[j]]) out.push(b[j]);
+    }
+    return out.join(',');
+  }
+
   function dump() {
     var list = document.querySelector('.task-card-list') ||
                document.querySelector('[class*="task-card"]');
@@ -107,8 +124,9 @@ object Script {
 
   // 领取成功后（服务端已确认）再考虑卸载本次新装的应用
   function cleanupNewPackages() {
-    if (!B.autoUninstall() || !S.lastT) return;
-    var pkgs = B.newPackagesSince(S.lastT);
+    if (!B.autoUninstall()) return;
+    var pkgs = S.newPkgs;
+    if (!pkgs && S.lastT) pkgs = B.newPackagesSince(S.lastT);
     if (!pkgs) return;
     var arr = pkgs.split(',');
     for (var i = 0; i < arr.length; i++) {
@@ -116,6 +134,7 @@ object Script {
       log('uninstall ' + arr[i]);
       B.uninstall(arr[i]);
     }
+    S.newPkgs = '';
     S.lastT = 0;
   }
 
@@ -125,6 +144,7 @@ object Script {
     S.claimed = 0;
     S.idle = 0;
     S.busy = 0;
+    S.newPkgs = '';
     S.stop = '';
     log('START max=' + B.maxTasks() + ' dwell=' + B.dwell() +
         ' uninstall=' + B.autoUninstall() + ' dry=' + B.dryRun());
@@ -142,40 +162,124 @@ object Script {
       if (claim) {
         S.busy = 0;
         var before = frag();
-        log('click CLAIM "' + txt(claim) + '" frag=' + before);
+        var resultBefore = B.taskResultVersion();
+        log('click CLAIM "' + txt(claim) + '" frag=' + before +
+            ' taskResult=' + resultBefore);
         st('领取中…');
         click(claim);
-        await sleep(3000);
-        var after = frag();
-        log('after claim frag=' + after);
-        if (after !== before || after > before) {
+
+        // 优先相信服务端/SDK 回执；页面数字刷新属于辅助证据。
+        // 11.3.5 TaskWall SDK 的成功码是 13097。
+        var success = false;
+        var after = before;
+        for (var wait = 0; wait < 15; wait++) {
+          await sleep(1000);
+          after = frag();
+          if (after > before) {
+            log('claim confirmed by fragments ' + before + ' -> ' + after);
+            success = true;
+            break;
+          }
+
+          var resultNow = B.taskResultVersion();
+          if (resultNow > resultBefore) {
+            var rc = B.taskResultCode();
+            var rm = B.taskResultMessage();
+            var sku = B.taskResultSkuId();
+            var trace = B.taskResultTraceId();
+            log('TaskWall result code=' + rc + ' skuId=' + sku +
+                ' traceId=' + trace + ' msg=' + rm);
+            if (rc === B.taskWallSuccessCode()) {
+              success = true;
+              log('claim confirmed by TaskWall SDK result');
+              break;
+            }
+          }
+        }
+
+        if (success) {
           S.claimed++;
           S.idle = 0;
           st('领取成功 · ' + after + ' 碎片');
           cleanupNewPackages();
         } else {
-          log('claim did not change count (server rejected) — wait');
-          st('服务端未发放，等待复核');
-          await sleep(5000);
+          log('claim not confirmed after 15s; keep task uncounted');
+          st('等待服务端确认…');
+          await sleep(2500);
         }
-        await sleep(1500);
+        await sleep(1000);
         continue;
       }
 
-      // 2) 打开刚装好的应用，按卡片要求的时长停留，再回到云服务
+      // 2) 打开应用：优先使用 11.3.5 TaskWall SDK 给出的真实 remainingTime，
+      //    页面文案只作为 SDK 未介入时的 fallback。
       var open = findBtn(OPEN);
       if (open) {
         S.busy = 0;
         var oc = cardOf(open);
         var sec = dwellOf(oc);
-        log('click OPEN "' + txt(open) + '" dwell=' + sec + 's');
-        st('浏览计时中 ' + sec + ' 秒');
+        var trackBefore = B.sdkTrackVersion();
+
+        log('click OPEN "' + txt(open) + '" fallbackDwell=' + sec + 's');
+        st('正在启动任务应用');
         click(open);
-        await sleep(4000);
+
+        // H5 调用 pay.openAppCountTime 后，SDK 会立即记录 package + remainingTime。
+        var sdkStarted = false;
+        for (var startWait = 0; startWait < 20; startWait++) {
+          await sleep(100);
+          if (B.sdkTrackVersion() > trackBefore) {
+            var sdkSec = B.sdkTrackRequiredSec();
+            if (sdkSec > 0 && sdkSec <= 600) {
+              sec = sdkSec;
+              sdkStarted = true;
+              log('SDK timing captured package=' + B.sdkTrackPackage() +
+                  ' required=' + sec + 's');
+            }
+            break;
+          }
+        }
+
+        st('浏览计时中 ' + sec + ' 秒' + (sdkStarted ? ' · SDK计时' : ''));
         await sleep(sec * 1000);
+
+        // 返回云服务后，SDK 会在 Activity.onResume 回调中给出 duration/timeLeft。
+        var resultBefore = B.sdkTrackVersion();
         B.bringToFront();
-        await sleep(4000);
-        st('已回到云服务');
+
+        var sdkVerified = false;
+        var left = -1;
+        for (var resultWait = 0; resultWait < 80; resultWait++) {
+          await sleep(100);
+          var resultNow = B.sdkTrackVersion();
+          if (resultNow > resultBefore) {
+            left = B.sdkTrackTimeLeftSec();
+            var duration = B.sdkTrackDurationSec();
+            log('SDK timing result package=' + B.sdkTrackPackage() +
+                ' duration=' + duration + 's timeLeft=' + left + 's');
+            if (left <= 0) {
+              sdkVerified = true;
+              st('SDK 已确认计时完成');
+            } else {
+              st('SDK 判定仍差 ' + left + ' 秒');
+            }
+            break;
+          }
+        }
+
+        if (!sdkVerified) {
+          if (left > 0) {
+            // 已经回到云服务且 SDK 明确报告不足时长，不把任务当成完成。
+            // 不额外空等；下一轮扫描会根据当前按钮状态决定是否重新执行任务。
+            st('计时不足，未确认完成');
+          } else {
+            // 某些任务不会走 SDK 回调，保留原有页面流程作为兼容 fallback。
+            await sleep(1500);
+            st('已回到云服务 · 等待任务刷新');
+          }
+        }
+
+        await sleep(1500);
         S.idle = 0;
         continue;
       }
@@ -192,17 +296,29 @@ object Script {
           await sleep(800);
           continue;
         }
+        // 以安装前包集合为基准做差集；这比 firstInstallTime 可靠，尤其是恢复备份/系统时间异常时。
+        S.beforePkgs = B.installedPackages();
         S.lastT = B.now();
         log('click INSTALL "' + txt(inst) + '"');
         st('下载安装中');
         click(inst);
-        await sleep(3000);
+        var installed = '';
         for (var i = 0; i < 90; i++) {
           await sleep(2000);
-          var np = B.newPackagesSince(S.lastT);
-          if (np) { log('installed: ' + np); st('已安装 · 待打开'); break; }
+          installed = packageDiff(S.beforePkgs);
+          if (installed) {
+            log('installed new package(s): ' + installed);
+            st('已安装 · 待打开');
+            break;
+          }
           if (!B.isRunning()) break;
         }
+        if (!installed) {
+          log('install timeout: no new package detected');
+        } else {
+          S.newPkgs = installed;
+        }
+        S.beforePkgs = '';
         S.idle = 0;
         await sleep(2000);
         continue;
@@ -247,6 +363,35 @@ object Script {
   }
 
   S.kick = function () { if (S.run) return; loop(); };
+
+  // 福利中心是 SPA：pushState/replaceState 不一定触发 onPageFinished。
+  // 在页面内监听路由变化，重新唤醒扫描器，避免进入福利中心子路由后“看得到任务但不执行”。
+  function hookHistory(name) {
+    try {
+      var old = history[name];
+      if (!old.__acWrapped) {
+        var wrapped = function () {
+          var r = old.apply(this, arguments);
+          setTimeout(function () {
+            if (location.href !== S.lastUrl) {
+              S.lastUrl = location.href;
+              log('SPA route changed: ' + location.href);
+            }
+            S.kick();
+          }, 300);
+          return r;
+        };
+        wrapped.__acWrapped = true;
+        history[name] = wrapped;
+      }
+    } catch (e) { log('history hook failed: ' + name); }
+  }
+  hookHistory('pushState');
+  hookHistory('replaceState');
+  window.addEventListener('popstate', function () {
+    setTimeout(function () { S.lastUrl = location.href; S.kick(); }, 300);
+  });
+
   if (B.isRunning()) { setTimeout(function () { loop(); }, 800); }
 
   // 页面一直开着时，面板点「开始」也能把循环拉起来（3 秒轮询一次触发标志）

@@ -40,6 +40,21 @@ object State {
     @Volatile var autoUninstall = false
     @Volatile var dryRun = false
 
+    // 11.3.5 TaskWall SDK 的 H5 结果回执：code=13097 为成功路径。
+    const val TASKWALL_SUCCESS_CODE = 13097
+    @Volatile var taskResultVersion = 0L
+    @Volatile var taskResultCode = Int.MIN_VALUE
+    @Volatile var taskResultMessage = ""
+    @Volatile var taskResultSkuId = ""
+    @Volatile var taskResultTraceId = ""
+
+    // TaskWall SDK openAppCountTime 的真实计时状态（11.3.5）。
+    @Volatile var sdkTrackVersion = 0L
+    @Volatile var sdkTrackPackage = ""
+    @Volatile var sdkTrackRequiredSec = -1
+    @Volatile var sdkTrackDurationSec = -1L
+    @Volatile var sdkTrackTimeLeftSec = -1L
+
     val main = Handler(Looper.getMainLooper())
     val injected: MutableSet<WebView> = Collections.newSetFromMap(WeakHashMap())
 
@@ -82,7 +97,12 @@ class MainHook : IXposedHookLoadPackage {
             }
         )
 
-        // 2) WebView 页面加载完成后注入自动化脚本
+        // 2) 直接接入 11.3.5 内置 TaskWall SDK 的结果回执。
+        //    H5 完成任务后，SDK 会构造 CloudTaskWallH5Result -> Bundle(code,msg,skuId,traceID)。
+        installTaskWallResultHook(lpparam.classLoader)
+        installTaskWallTrackingHooks(lpparam.classLoader)
+
+        // 3) WebView 页面加载完成后注入自动化脚本
         XposedHelpers.findAndHookMethod(
             "android.webkit.WebViewClient", lpparam.classLoader,
             "onPageFinished", WebView::class.java, String::class.java,
@@ -95,7 +115,7 @@ class MainHook : IXposedHookLoadPackage {
             }
         )
 
-        // 3) 兜底：SPA 首屏不一定走子类的 onPageFinished，loadUrl 后轮询一次
+        // 4) 兜底：SPA 首屏不一定走子类的 onPageFinished，loadUrl 后轮询一次
         XposedHelpers.findAndHookMethod(
             WebView::class.java, "loadUrl", String::class.java,
             object : XC_MethodHook() {
@@ -108,6 +128,97 @@ class MainHook : IXposedHookLoadPackage {
         )
 
         XposedBridge.log("[AutoCloud] loaded in " + lpparam.packageName)
+    }
+
+    private fun installTaskWallResultHook(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                "com.heytap.cloud.taskwall.api.CloudTaskWallH5Result",
+                classLoader,
+                "e",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val bundle = param.result as? android.os.Bundle ?: return
+                        val code = bundle.getInt("code", Int.MIN_VALUE)
+                        val msg = bundle.getString("msg").orEmpty()
+                        val skuId = bundle.getString("skuId").orEmpty()
+                        val traceId = bundle.getString("traceID").orEmpty()
+
+                        State.taskResultCode = code
+                        State.taskResultMessage = msg
+                        State.taskResultSkuId = skuId
+                        State.taskResultTraceId = traceId
+                        State.taskResultVersion = System.nanoTime()
+
+                        XposedBridge.log(
+                            "[AutoCloud] TaskWall result code=$code skuId=$skuId " +
+                                "traceId=$traceId msg=" + msg.take(120)
+                        )
+                    }
+                },
+            )
+        }.onFailure {
+            // 兼容未来移除/改名的 TaskWall 类：DOM 自动化仍然可以运行。
+            XposedBridge.log("[AutoCloud] TaskWall result hook unavailable: " + it)
+        }
+    }
+
+    private fun installTaskWallTrackingHooks(classLoader: ClassLoader) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute",
+                classLoader,
+                "openAppAndStartTracking",
+                android.app.Activity::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                "eb0.a",
+                String::class.java,
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        State.sdkTrackPackage = param.args[1] as? String ?: ""
+                        State.sdkTrackRequiredSec = (param.args[2] as? Int) ?: -1
+                        State.sdkTrackVersion = System.nanoTime()
+                        XposedBridge.log(
+                            "[AutoCloud] SDK tracking package=" + State.sdkTrackPackage +
+                                " required=" + State.sdkTrackRequiredSec + "s"
+                        )
+                    }
+                },
+            )
+        }.onFailure {
+            XposedBridge.log("[AutoCloud] SDK openAppCountTime hook unavailable: " + it)
+        }
+
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute" + "$" + "a",
+                classLoader,
+                "a",
+                org.json.JSONObject::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val result = param.args[0] as? org.json.JSONObject ?: return
+                        val packageName = result.optString("packageName")
+                        val duration = result.optLong("duration", -1L)
+                        val timeLeft = result.optLong("timeLeft", -1L)
+
+                        State.sdkTrackPackage = packageName
+                        State.sdkTrackDurationSec = duration
+                        State.sdkTrackTimeLeftSec = timeLeft
+                        State.sdkTrackVersion = System.nanoTime()
+
+                        XposedBridge.log(
+                            "[AutoCloud] SDK tracking result package=" + packageName +
+                                " duration=" + duration + "s timeLeft=" + timeLeft + "s"
+                        )
+                    }
+                },
+            )
+        }.onFailure {
+            XposedBridge.log("[AutoCloud] SDK tracking result hook unavailable: " + it)
+        }
     }
 
     private fun tryAttach(wv: WebView) {
