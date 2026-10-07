@@ -211,20 +211,75 @@ object Script {
         continue;
       }
 
-      // 2) 打开刚装好的应用，按卡片要求的时长停留，再回到云服务
+      // 2) 打开应用：优先使用 11.3.5 TaskWall SDK 给出的真实 remainingTime，
+      //    页面文案只作为 SDK 未介入时的 fallback。
       var open = findBtn(OPEN);
       if (open) {
         S.busy = 0;
         var oc = cardOf(open);
         var sec = dwellOf(oc);
-        log('click OPEN "' + txt(open) + '" dwell=' + sec + 's');
-        st('浏览计时中 ' + sec + ' 秒');
+        var trackBefore = B.sdkTrackVersion();
+
+        log('click OPEN "' + txt(open) + '" fallbackDwell=' + sec + 's');
+        st('正在启动任务应用');
         click(open);
-        await sleep(4000);
+
+        // H5 调用 pay.openAppCountTime 后，SDK 会立即记录 package + remainingTime。
+        var sdkStarted = false;
+        for (var startWait = 0; startWait < 20; startWait++) {
+          await sleep(100);
+          if (B.sdkTrackVersion() > trackBefore) {
+            var sdkSec = B.sdkTrackRequiredSec();
+            if (sdkSec > 0 && sdkSec <= 600) {
+              sec = sdkSec;
+              sdkStarted = true;
+              log('SDK timing captured package=' + B.sdkTrackPackage() +
+                  ' required=' + sec + 's');
+            }
+            break;
+          }
+        }
+
+        st('浏览计时中 ' + sec + ' 秒' + (sdkStarted ? ' · SDK计时' : ''));
         await sleep(sec * 1000);
+
+        // 返回云服务后，SDK 会在 Activity.onResume 回调中给出 duration/timeLeft。
+        var resultBefore = B.sdkTrackVersion();
         B.bringToFront();
-        await sleep(4000);
-        st('已回到云服务');
+
+        var sdkVerified = false;
+        var left = -1;
+        for (var resultWait = 0; resultWait < 80; resultWait++) {
+          await sleep(100);
+          var resultNow = B.sdkTrackVersion();
+          if (resultNow > resultBefore) {
+            left = B.sdkTrackTimeLeftSec();
+            var duration = B.sdkTrackDurationSec();
+            log('SDK timing result package=' + B.sdkTrackPackage() +
+                ' duration=' + duration + 's timeLeft=' + left + 's');
+            if (left <= 0) {
+              sdkVerified = true;
+              st('SDK 已确认计时完成');
+            } else {
+              st('SDK 判定仍差 ' + left + ' 秒');
+            }
+            break;
+          }
+        }
+
+        if (!sdkVerified) {
+          if (left > 0) {
+            // 已经回到云服务且 SDK 明确报告不足时长，不把任务当成完成。
+            await sleep(Math.min(left, 60) * 1000);
+            st('计时不足，未确认完成');
+          } else {
+            // 某些任务不会走 SDK 回调，保留原有页面流程作为兼容 fallback。
+            await sleep(1500);
+            st('已回到云服务 · 等待任务刷新');
+          }
+        }
+
+        await sleep(1500);
         S.idle = 0;
         continue;
       }
