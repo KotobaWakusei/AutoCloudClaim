@@ -19,7 +19,10 @@ object Script {
   var B = window.autocloud;
   if (!B) { return; }
 
-  var S = { run: false, started: 0, claimed: 0, idle: 0, busy: 0, lastT: 0, stop: '' };
+  var S = {
+    run: false, started: 0, claimed: 0, idle: 0, busy: 0,
+    lastT: 0, beforePkgs: '', stop: '', lastUrl: location.href
+  };
   window.__AC = S;
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -90,6 +93,20 @@ object Script {
 
   function scrollNext() { window.scrollBy(0, 360); }
 
+  function packageDiff(before) {
+    var now = B.installedPackages();
+    if (!now) return '';
+    var oldSet = {};
+    var a = String(before || '').split(',');
+    for (var i = 0; i < a.length; i++) if (a[i]) oldSet[a[i]] = true;
+    var out = [];
+    var b = now.split(',');
+    for (var j = 0; j < b.length; j++) {
+      if (b[j] && !oldSet[b[j]]) out.push(b[j]);
+    }
+    return out.join(',');
+  }
+
   function dump() {
     var list = document.querySelector('.task-card-list') ||
                document.querySelector('[class*="task-card"]');
@@ -145,20 +162,29 @@ object Script {
         log('click CLAIM "' + txt(claim) + '" frag=' + before);
         st('领取中…');
         click(claim);
-        await sleep(3000);
-        var after = frag();
-        log('after claim frag=' + after);
-        if (after !== before || after > before) {
+
+        // H5 的奖励回执可能晚于点击事件；3 秒单点采样会把“已成功但 UI 尚未刷新”
+        // 错判成失败。这里轮询一段时间，只在碎片数真正增加时计数。
+        var success = false;
+        var after = before;
+        for (var wait = 0; wait < 12; wait++) {
+          await sleep(1000);
+          after = frag();
+          if (after > before) { success = true; break; }
+        }
+
+        if (success) {
           S.claimed++;
           S.idle = 0;
+          log('claim confirmed frag=' + before + ' -> ' + after);
           st('领取成功 · ' + after + ' 碎片');
           cleanupNewPackages();
         } else {
-          log('claim did not change count (server rejected) — wait');
-          st('服务端未发放，等待复核');
-          await sleep(5000);
+          log('claim not confirmed after 12s; keep task uncounted');
+          st('等待服务端确认…');
+          await sleep(2500);
         }
-        await sleep(1500);
+        await sleep(1000);
         continue;
       }
 
@@ -192,17 +218,25 @@ object Script {
           await sleep(800);
           continue;
         }
+        // 以安装前包集合为基准做差集；这比 firstInstallTime 可靠，尤其是恢复备份/系统时间异常时。
+        S.beforePkgs = B.installedPackages();
         S.lastT = B.now();
         log('click INSTALL "' + txt(inst) + '"');
         st('下载安装中');
         click(inst);
-        await sleep(3000);
+        var installed = '';
         for (var i = 0; i < 90; i++) {
           await sleep(2000);
-          var np = B.newPackagesSince(S.lastT);
-          if (np) { log('installed: ' + np); st('已安装 · 待打开'); break; }
+          installed = packageDiff(S.beforePkgs);
+          if (installed) {
+            log('installed new package(s): ' + installed);
+            st('已安装 · 待打开');
+            break;
+          }
           if (!B.isRunning()) break;
         }
+        if (!installed) log('install timeout: no new package detected');
+        S.beforePkgs = '';
         S.idle = 0;
         await sleep(2000);
         continue;
@@ -247,6 +281,35 @@ object Script {
   }
 
   S.kick = function () { if (S.run) return; loop(); };
+
+  // 福利中心是 SPA：pushState/replaceState 不一定触发 onPageFinished。
+  // 在页面内监听路由变化，重新唤醒扫描器，避免进入福利中心子路由后“看得到任务但不执行”。
+  function hookHistory(name) {
+    try {
+      var old = history[name];
+      if (!old.__acWrapped) {
+        var wrapped = function () {
+          var r = old.apply(this, arguments);
+          setTimeout(function () {
+            if (location.href !== S.lastUrl) {
+              S.lastUrl = location.href;
+              log('SPA route changed: ' + location.href);
+            }
+            S.kick();
+          }, 300);
+          return r;
+        };
+        wrapped.__acWrapped = true;
+        history[name] = wrapped;
+      }
+    } catch (e) { log('history hook failed: ' + name); }
+  }
+  hookHistory('pushState');
+  hookHistory('replaceState');
+  window.addEventListener('popstate', function () {
+    setTimeout(function () { S.lastUrl = location.href; S.kick(); }, 300);
+  });
+
   if (B.isRunning()) { setTimeout(function () { loop(); }, 800); }
 
   // 页面一直开着时，面板点「开始」也能把循环拉起来（3 秒轮询一次触发标志）
