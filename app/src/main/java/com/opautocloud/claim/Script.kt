@@ -270,7 +270,7 @@ object Script {
         if (!sdkVerified) {
           if (left > 0) {
             // 已经回到云服务且 SDK 明确报告不足时长，不把任务当成完成。
-            await sleep(Math.min(left, 60) * 1000);
+            // 不额外空等；下一轮扫描会根据当前按钮状态决定是否重新执行任务。
             st('计时不足，未确认完成');
           } else {
             // 某些任务不会走 SDK 回调，保留原有页面流程作为兼容 fallback。
