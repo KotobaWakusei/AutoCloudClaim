@@ -232,19 +232,132 @@ class MainHook : IXposedHookLoadPackage {
 }
 
 object Injector {
+    private const val MAX_PROBE_ATTEMPTS = 5
+    private val probeDelaysMs = longArrayOf(0L, 250L, 750L, 1500L, 3000L)
+
     fun attach(wv: WebView, url: String) {
         State.main.post {
             try {
-                if (!State.injected.contains(wv)) {
-                    // JS 接口加一次即可；页面重载后 evaluateJavascript 需要重新执行
-                    wv.addJavascriptInterface(Bridge(wv), "autocloud")
-                    State.injected.add(wv)
-                }
-                wv.evaluateJavascript(Script.BODY, null)
-                XposedBridge.log("[AutoCloud] attached $url")
+                // addJavascriptInterface 必须在 WebView 所在线程完成。
+                // 每次页面 attach 都重新绑定，避免 SPA/renderer 导航后桥对象状态不一致。
+                wv.addJavascriptInterface(Bridge(wv), "autocloud")
+                State.injected.add(wv)
+                XposedBridge.log("[AutoCloud] bridge installed url=$url")
+
+                probeAndInject(wv, url, 0)
             } catch (t: Throwable) {
-                XposedBridge.log(t)
+                XposedBridge.log("[AutoCloud] attach failed url=$url: " + t.stackTraceToString())
             }
+        }
+    }
+
+    private fun probeAndInject(wv: WebView, url: String, attempt: Int) {
+        val delay = probeDelaysMs[attempt.coerceIn(0, probeDelaysMs.lastIndex)]
+        State.main.postDelayed({
+            try {
+                if (wv.url?.contains("/profit/") != true) {
+                    XposedBridge.log("[AutoCloud] probe skipped: url changed to ${wv.url}")
+                    return@postDelayed
+                }
+
+                val probe = """
+                    (function () {
+                        try {
+                            return JSON.stringify({
+                                bridge: typeof window.autocloud,
+                                ac: typeof window.__AC,
+                                readyState: document.readyState,
+                                href: location.href
+                            });
+                        } catch (e) {
+                            return JSON.stringify({
+                                bridge: "probe-error",
+                                error: String(e && (e.stack || e.message || e))
+                            });
+                        }
+                    })()
+                """.trimIndent()
+
+                wv.evaluateJavascript(probe) { raw ->
+                    val result = raw ?: "null"
+                    XposedBridge.log("[AutoCloud][JSProbe] attempt=$attempt result=$result")
+
+                    if (raw == null || raw == "null" || !raw.contains("\"bridge\":\"object\"")) {
+                        if (attempt + 1 < MAX_PROBE_ATTEMPTS) {
+                            XposedBridge.log(
+                                "[AutoCloud][JSProbe] bridge not ready; retry " +
+                                    "${attempt + 1}/${MAX_PROBE_ATTEMPTS - 1}"
+                            )
+                            probeAndInject(wv, url, attempt + 1)
+                        } else {
+                            XposedBridge.log(
+                                "[AutoCloud][JSProbe] FAILED bridge unavailable after " +
+                                    "$MAX_PROBE_ATTEMPTS attempts url=$url"
+                            )
+                        }
+                        return@evaluateJavascript
+                    }
+
+                    evaluateScript(wv, url)
+                }
+            } catch (t: Throwable) {
+                XposedBridge.log(
+                    "[AutoCloud][JSProbe] evaluate failed attempt=$attempt: " +
+                        t.stackTraceToString()
+                )
+                if (attempt + 1 < MAX_PROBE_ATTEMPTS) {
+                    probeAndInject(wv, url, attempt + 1)
+                }
+            }
+        }, delay)
+    }
+
+    private fun evaluateScript(wv: WebView, url: String) {
+        val wrapped = """
+            (function () {
+                try {
+                    window.addEventListener("error", function (e) {
+                        try {
+                            if (window.autocloud) {
+                                window.autocloud.log(
+                                    "window.error: " + String(e.message || e.error || e)
+                                );
+                            }
+                        } catch (_) {}
+                    });
+                    window.addEventListener("unhandledrejection", function (e) {
+                        try {
+                            if (window.autocloud) {
+                                window.autocloud.log(
+                                    "unhandledrejection: " + String(e.reason || e)
+                                );
+                            }
+                        } catch (_) {}
+                    });
+                    __SCRIPT_BODY__
+                    return "injected";
+                } catch (e) {
+                    try {
+                        window.autocloud.log(
+                            "INJECT EXCEPTION: " + String(e && (e.stack || e.message || e))
+                        );
+                    } catch (_) {}
+                    return "inject-error:" + String(e && (e.message || e));
+                }
+            })()
+        """.trimIndent().replace("__SCRIPT_BODY__", Script.BODY)
+
+        try {
+            wv.evaluateJavascript(wrapped) { result ->
+                XposedBridge.log(
+                    "[AutoCloud][JSProbe] script result=${result ?: "null"} url=$url"
+                )
+                XposedBridge.log("[AutoCloud] attached $url")
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log(
+                "[AutoCloud] script evaluation failed url=$url: " + t.stackTraceToString()
+            )
         }
     }
 }
