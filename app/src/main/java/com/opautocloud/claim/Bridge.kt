@@ -59,21 +59,36 @@ class Bridge(private val wv: WebView) {
         false
     }
 
-    /** 返回 firstInstallTime >= t 的新安装包名，逗号分隔。 */
+    /** 返回当前已安装的非系统包名快照。由 JS 与安装前快照做差集，避免 firstInstallTime 时钟/恢复导致误判。 */
+    @JavascriptInterface
+    fun installedPackages(): String = try {
+        app.packageManager.getInstalledPackages(0)
+            .asSequence()
+            .filter { pi ->
+                if (pi.packageName == app.packageName) return@filter false
+                val flags = pi.applicationInfo?.flags ?: 0
+                (flags and (android.content.pm.ApplicationInfo.FLAG_SYSTEM or
+                    android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) == 0
+            }
+            .map { it.packageName }
+            .sorted()
+            .joinToString(",")
+    } catch (err: Throwable) {
+        ""
+    }
+
+    /** 保留旧接口兼容性；时间条件仅作辅助，不再作为唯一安装判据。 */
     @JavascriptInterface
     fun newPackagesSince(t: Long): String = try {
-        val sb = StringBuilder()
-        for (pi in app.packageManager.getInstalledPackages(0)) {
-            if (pi.firstInstallTime < t) continue
-            if (pi.packageName == app.packageName) continue
-            val sys = (pi.applicationInfo?.flags ?: 0) and
-                (android.content.pm.ApplicationInfo.FLAG_SYSTEM or
-                    android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)
-            if (sys != 0) continue
-            if (sb.isNotEmpty()) sb.append(',')
-            sb.append(pi.packageName)
-        }
-        sb.toString()
+        installedPackages()
+            .split(',')
+            .filter { it.isNotBlank() }
+            .filter { pkg ->
+                runCatching {
+                    app.packageManager.getPackageInfo(pkg, 0).firstInstallTime >= t
+                }.getOrDefault(false)
+            }
+            .joinToString(",")
     } catch (err: Throwable) {
         ""
     }
