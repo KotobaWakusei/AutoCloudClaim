@@ -107,41 +107,34 @@ class Bridge(private val wv: WebView) {
         ""
     }
 
-    /** 拉起目标应用（必须在主线程）。 */
+    /** 拉起应用：Bridge 调用不能同步等待主线程，否则容易形成 WebView/主线程死锁。 */
     @JavascriptInterface
     fun launch(pkg: String): Boolean {
-        val r = BooleanArray(1)
+        if (!isValidPackage(pkg)) return false
+        val intent = runCatching { app.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
+            ?: return false
         main.post {
-            r[0] = try {
-                val it = app.packageManager.getLaunchIntentForPackage(pkg) ?: return@post
-                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                app.startActivity(it)
-                true
-            } catch (t: Throwable) {
-                XposedBridge.log(t); false
-            }
+            runCatching {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                app.startActivity(intent)
+            }.onFailure { XposedBridge.log("[AutoCloud] launch failed: " + it) }
         }
-        waitMain()
-        return r[0]
+        return true
     }
 
-    /** 把云服务 App 拉回前台（回到 H5 继续浏览计时/领取）。 */
+    /** 把云服务 App 拉回前台；异步执行，不阻塞 JS Bridge 线程。 */
     @JavascriptInterface
     fun bringToFront(): Boolean {
-        val r = BooleanArray(1)
+        val intent = runCatching {
+            app.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
+        }.getOrNull() ?: return false
         main.post {
-            r[0] = try {
-                val it = app.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
-                    ?: return@post
-                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                app.startActivity(it)
-                true
-            } catch (t: Throwable) {
-                XposedBridge.log(t); false
-            }
+            runCatching {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                app.startActivity(intent)
+            }.onFailure { XposedBridge.log("[AutoCloud] bringToFront failed: " + it) }
         }
-        waitMain()
-        return r[0]
+        return true
     }
 
     /**
@@ -151,11 +144,11 @@ class Bridge(private val wv: WebView) {
      */
     @JavascriptInterface
     fun uninstall(pkg: String): Boolean {
-        if (!State.autoUninstall) return false
-        if (pkg.isBlank() || pkg == State.TARGET_PKG || pkg == app.packageName) return false
-        val a = shell("pm uninstall --user 0 $pkg")
+        if (!State.autoUninstall || !isValidPackage(pkg)) return false
+        if (pkg == State.TARGET_PKG || pkg == app.packageName) return false
+        val a = shell(arrayOf("pm", "uninstall", "--user", "0", pkg))
         if (a) return true
-        return shell("su -c 'pm uninstall $pkg'")
+        return shell(arrayOf("su", "-c", "pm uninstall " + pkg))
     }
 
     @JavascriptInterface
@@ -163,19 +156,20 @@ class Bridge(private val wv: WebView) {
 
     // ---------- helpers ----------
 
-    private fun waitMain() {
-        val latch = java.util.concurrent.CountDownLatch(1)
-        main.post { latch.countDown() }
-        latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
-    }
+    private fun isValidPackage(pkg: String): Boolean =
+        pkg.matches(Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+"))
 
-    private fun shell(cmd: String): Boolean = try {
-        val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-        val out = BufferedReader(InputStreamReader(p.inputStream)).readText()
-        val err = BufferedReader(InputStreamReader(p.errorStream)).readText()
-        p.waitFor()
-        XposedBridge.log("[AutoCloud] shell: " + cmd + " -> " + out.trim() + " " + err.trim())
-        out.contains("Success")
+    private fun shell(command: Array<String>): Boolean = try {
+        val p = ProcessBuilder(*command)
+            .redirectErrorStream(true)
+            .start()
+        val output = p.inputStream.bufferedReader().use { it.readText() }
+        val exit = p.waitFor()
+        XposedBridge.log(
+            "[AutoCloud] shell: " + command.joinToString(" ") +
+                " -> exit=" + exit + " " + output.trim()
+        )
+        exit == 0 && output.contains("Success", ignoreCase = true)
     } catch (t: Throwable) {
         XposedBridge.log(t)
         false
