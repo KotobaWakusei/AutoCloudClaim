@@ -21,7 +21,7 @@ object Script {
 
   var S = {
     run: false, started: 0, claimed: 0, idle: 0, busy: 0,
-    lastT: 0, beforePkgs: '', stop: '', lastUrl: location.href
+    lastT: 0, beforePkgs: '', newPkgs: '', stop: '', lastUrl: location.href
   };
   window.__AC = S;
 
@@ -124,8 +124,9 @@ object Script {
 
   // 领取成功后（服务端已确认）再考虑卸载本次新装的应用
   function cleanupNewPackages() {
-    if (!B.autoUninstall() || !S.lastT) return;
-    var pkgs = B.newPackagesSince(S.lastT);
+    if (!B.autoUninstall()) return;
+    var pkgs = S.newPkgs;
+    if (!pkgs && S.lastT) pkgs = B.newPackagesSince(S.lastT);
     if (!pkgs) return;
     var arr = pkgs.split(',');
     for (var i = 0; i < arr.length; i++) {
@@ -133,6 +134,7 @@ object Script {
       log('uninstall ' + arr[i]);
       B.uninstall(arr[i]);
     }
+    S.newPkgs = '';
     S.lastT = 0;
   }
 
@@ -142,6 +144,7 @@ object Script {
     S.claimed = 0;
     S.idle = 0;
     S.busy = 0;
+    S.newPkgs = '';
     S.stop = '';
     log('START max=' + B.maxTasks() + ' dwell=' + B.dwell() +
         ' uninstall=' + B.autoUninstall() + ' dry=' + B.dryRun());
@@ -159,28 +162,48 @@ object Script {
       if (claim) {
         S.busy = 0;
         var before = frag();
-        log('click CLAIM "' + txt(claim) + '" frag=' + before);
+        var resultBefore = B.taskResultVersion();
+        log('click CLAIM "' + txt(claim) + '" frag=' + before +
+            ' taskResult=' + resultBefore);
         st('领取中…');
         click(claim);
 
-        // H5 的奖励回执可能晚于点击事件；3 秒单点采样会把“已成功但 UI 尚未刷新”
-        // 错判成失败。这里轮询一段时间，只在碎片数真正增加时计数。
+        // 优先相信服务端/SDK 回执；页面数字刷新属于辅助证据。
+        // 11.3.5 TaskWall SDK 的成功码是 13097。
         var success = false;
         var after = before;
-        for (var wait = 0; wait < 12; wait++) {
+        for (var wait = 0; wait < 15; wait++) {
           await sleep(1000);
           after = frag();
-          if (after > before) { success = true; break; }
+          if (after > before) {
+            log('claim confirmed by fragments ' + before + ' -> ' + after);
+            success = true;
+            break;
+          }
+
+          var resultNow = B.taskResultVersion();
+          if (resultNow > resultBefore) {
+            var rc = B.taskResultCode();
+            var rm = B.taskResultMessage();
+            var sku = B.taskResultSkuId();
+            var trace = B.taskResultTraceId();
+            log('TaskWall result code=' + rc + ' skuId=' + sku +
+                ' traceId=' + trace + ' msg=' + rm);
+            if (rc === B.taskWallSuccessCode()) {
+              success = true;
+              log('claim confirmed by TaskWall SDK result');
+              break;
+            }
+          }
         }
 
         if (success) {
           S.claimed++;
           S.idle = 0;
-          log('claim confirmed frag=' + before + ' -> ' + after);
           st('领取成功 · ' + after + ' 碎片');
           cleanupNewPackages();
         } else {
-          log('claim not confirmed after 12s; keep task uncounted');
+          log('claim not confirmed after 15s; keep task uncounted');
           st('等待服务端确认…');
           await sleep(2500);
         }
@@ -235,7 +258,11 @@ object Script {
           }
           if (!B.isRunning()) break;
         }
-        if (!installed) log('install timeout: no new package detected');
+        if (!installed) {
+          log('install timeout: no new package detected');
+        } else {
+          S.newPkgs = installed;
+        }
         S.beforePkgs = '';
         S.idle = 0;
         await sleep(2000);
