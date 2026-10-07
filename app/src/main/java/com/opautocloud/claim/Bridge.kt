@@ -36,6 +36,12 @@ class Bridge(private val wv: WebView) {
     @JavascriptInterface fun taskResultTraceId(): String = State.taskResultTraceId
     @JavascriptInterface fun taskWallSuccessCode(): Int = State.TASKWALL_SUCCESS_CODE
 
+    @JavascriptInterface fun sdkTrackVersion(): Long = State.sdkTrackVersion
+    @JavascriptInterface fun sdkTrackPackage(): String = State.sdkTrackPackage
+    @JavascriptInterface fun sdkTrackRequiredSec(): Int = State.sdkTrackRequiredSec
+    @JavascriptInterface fun sdkTrackDurationSec(): Long = State.sdkTrackDurationSec
+    @JavascriptInterface fun sdkTrackTimeLeftSec(): Long = State.sdkTrackTimeLeftSec
+
     @JavascriptInterface
     fun log(msg: String) {
         XposedBridge.log("[AutoCloud][JS] " + msg)
