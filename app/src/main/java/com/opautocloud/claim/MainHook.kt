@@ -232,19 +232,24 @@ class MainHook : IXposedHookLoadPackage {
 }
 
 object Injector {
-    private const val MAX_PROBE_ATTEMPTS = 5
-    private val probeDelaysMs = longArrayOf(0L, 250L, 750L, 1500L, 3000L)
+    private const val MAX_PROBE_ATTEMPTS = 6
+    private val probeDelaysMs = longArrayOf(0L, 200L, 500L, 1000L, 2000L, 4000L)
+    private val attachedUrls = WeakHashMap<WebView, String>()
 
     fun attach(wv: WebView, url: String) {
         State.main.post {
             try {
-                // addJavascriptInterface 必须在 WebView 所在线程完成。
-                // 每次页面 attach 都重新绑定，避免 SPA/renderer 导航后桥对象状态不一致。
+                val current = wv.url ?: url
+                val previous = attachedUrls[wv]
+                if (previous == current) {
+                    probeAndInject(wv, current, 0)
+                    return@post
+                }
                 wv.addJavascriptInterface(Bridge(wv), "autocloud")
+                attachedUrls[wv] = current
                 State.injected.add(wv)
-                XposedBridge.log("[AutoCloud] bridge installed url=$url")
-
-                probeAndInject(wv, url, 0)
+                XposedBridge.log("[AutoCloud] bridge installed url=$current")
+                probeAndInject(wv, current, 0)
             } catch (t: Throwable) {
                 XposedBridge.log("[AutoCloud] attach failed url=$url: " + t.stackTraceToString())
             }
@@ -282,7 +287,9 @@ object Injector {
                     val result = raw ?: "null"
                     XposedBridge.log("[AutoCloud][JSProbe] attempt=$attempt result=$result")
 
-                    if (raw == null || raw == "null" || !raw.contains("\"bridge\":\"object\"")) {
+                    if (raw == null || raw == "null" ||
+                        (!raw.contains("\"bridge\":\"object\"") &&
+                         !raw.contains("\"bridge\": \"object\""))) {
                         if (attempt + 1 < MAX_PROBE_ATTEMPTS) {
                             XposedBridge.log(
                                 "[AutoCloud][JSProbe] bridge not ready; retry " +
