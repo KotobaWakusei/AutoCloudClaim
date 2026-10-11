@@ -48,21 +48,29 @@ object Script {
 
   // 在候选元素里找「文字精确匹配 + 可见 + 未禁用 + 面积最小」的那个（最小面积 ≈ 真正的按钮）
   function findBtn(re) {
-    var all = pool(), best = null, bestArea = 1e12;
+    var all = pool(), best = null, bestScore = -1e9;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!vis(el)) continue;
-      if (el.getAttribute('data-ac-skip')) continue;   // 已判定需人工，跳过
+      if (el.getAttribute('data-ac-skip')) continue;
       var t = txt(el);
-      if (!t || t.length > 24) continue;
-      if (!re.test(t)) continue;
-      if (BLACK.test(t)) continue;
+      if (!t || t.length > 32 || !re.test(t) || BLACK.test(t)) continue;
       if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
-      if (el.className && String(el.className).indexOf('disabled') >= 0) continue;
-      var r = el.getBoundingClientRect();
-      var a = r.width * r.height;
-      if (a < 40) continue;
-      if (a < bestArea) { best = el; bestArea = a; }
+      if (el.className && /(^|[ _-])disabled([ _-]|$)/i.test(String(el.className))) continue;
+      var r = el.getBoundingClientRect(), area = r.width * r.height;
+      if (area < 40) continue;
+
+      var tag = String(el.tagName || '').toLowerCase();
+      var role = String(el.getAttribute('role') || '').toLowerCase();
+      var score = 0;
+      if (tag === 'button') score += 1000;
+      else if (role === 'button') score += 900;
+      else if (tag === 'a') score += 700;
+      else score += 100;
+      if (el.onclick || el.getAttribute('onclick')) score += 100;
+      if (el.tabIndex >= 0) score += 20;
+      score -= Math.min(area / 100000, 20);
+      if (score > bestScore) { best = el; bestScore = score; }
     }
     return best;
   }
@@ -91,7 +99,9 @@ object Script {
     el.click();
   }
 
-  function scrollNext() { window.scrollBy(0, 360); }
+  function scrollNext() {
+    try { window.scrollBy(0, Math.max(280, Math.floor(window.innerHeight * 0.55))); } catch (e) {}
+  }
 
   function packageDiff(before) {
     var now = B.installedPackages();
@@ -244,17 +254,20 @@ object Script {
         await sleep(sec * 1000);
 
         // 返回云服务后，SDK 会在 Activity.onResume 回调中给出 duration/timeLeft。
-        var resultBefore = B.sdkTrackVersion();
+        // Use the version captured before clicking OPEN. The SDK result can arrive
+        // while the external app is foregrounded, before this WebView resumes.
+        // Comparing against a snapshot taken here would miss that already-delivered result.
         B.bringToFront();
 
         var sdkVerified = false;
         var left = -1;
         for (var resultWait = 0; resultWait < 80; resultWait++) {
-          await sleep(100);
           var resultNow = B.sdkTrackVersion();
-          if (resultNow > resultBefore) {
-            left = B.sdkTrackTimeLeftSec();
-            var duration = B.sdkTrackDurationSec();
+          var duration = B.sdkTrackDurationSec();
+          left = B.sdkTrackTimeLeftSec();
+          // A start-tracking callback also bumps the version. Only accept an actual
+          // result payload, not the start event or stale values from a previous task.
+          if (resultNow > trackBefore && duration >= 0 && left >= 0) {
             log('SDK timing result package=' + B.sdkTrackPackage() +
                 ' duration=' + duration + 's timeLeft=' + left + 's');
             if (left <= 0) {
@@ -265,6 +278,7 @@ object Script {
             }
             break;
           }
+          await sleep(100);
         }
 
         if (!sdkVerified) {
@@ -352,9 +366,13 @@ object Script {
       }
 
       S.idle++;
-      if (S.idle > 6) { log('STOP no actionable task left'); S.stop = '无可做任务 · 已停止'; break; }
+      if (S.idle > 18) {
+        log('STOP no actionable task left after extended scan');
+        S.stop = '无可做任务 · 已停止';
+        break;
+      }
       scrollNext();
-      await sleep(3500);
+      await sleep(S.idle < 5 ? 2500 : 4000);
     }
 
     S.run = false;
@@ -391,6 +409,15 @@ object Script {
   window.addEventListener('popstate', function () {
     setTimeout(function () { S.lastUrl = location.href; S.kick(); }, 300);
   });
+
+  try {
+    var acObserver = new MutationObserver(function () {
+      if (!S.run && B.isRunning()) S.kick();
+    });
+    acObserver.observe(document.documentElement || document.body, {
+      childList: true, subtree: true
+    });
+  } catch (e) { log('mutation observer failed: ' + e); }
 
   if (B.isRunning()) { setTimeout(function () { loop(); }, 800); }
 
