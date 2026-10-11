@@ -52,6 +52,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -125,6 +126,7 @@ fun ControlScreen() {
     var claimed by remember { mutableIntStateOf(0) }
     var fragments by remember { mutableIntStateOf(0) }
     var lastAck by remember { mutableLongStateOf(0L) }
+    var lastAckSession by remember { mutableStateOf("") }
     var sessionToken by rememberSaveable { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
     val logs = remember { mutableStateListOf<String>() }
@@ -147,6 +149,9 @@ fun ControlScreen() {
         lastAck > 0 && System.currentTimeMillis() - lastAck < 12_000
     }
 
+    val latestAckSession by rememberUpdatedState(lastAckSession)
+    val latestPhase by rememberUpdatedState(phase)
+
     // 接收云服务进程的状态回执
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
@@ -155,6 +160,7 @@ fun ControlScreen() {
                 // Accept only replies carrying the unpredictable token generated for this run.
                 if (sessionToken.isBlank() || i.getStringExtra("session") != sessionToken) return
                 lastAck = System.currentTimeMillis()
+                lastAckSession = i.getStringExtra("session").orEmpty()
                 running = i.getBooleanExtra("running", running)
                 i.getStringExtra("phase")?.let { phase = it }
                 if (i.hasExtra("claimed")) claimed = i.getIntExtra("claimed", claimed)
@@ -168,13 +174,47 @@ fun ControlScreen() {
         onDispose { runCatching { ctx.unregisterReceiver(receiver) } }
     }
 
-    // START 广播发出后等回执，判断云服务进程是否活着
+    // 点击开始后先拉起目标 App，再持续重发 START，解决进程启动期间动态接收器尚未注册的竞态。
     var startTick by remember { mutableIntStateOf(0) }
+    var startInProgress by remember { mutableStateOf(false) }
     LaunchedEffect(startTick) {
         if (startTick == 0) return@LaunchedEffect
-        delay(3500)
-        if (lastAck == 0L || System.currentTimeMillis() - lastAck > 3000) {
-            push("! 无回执：请先打开云服务 App 并进入「福利中心 · 赚碎片兑云空间」")
+        val token = sessionToken
+        val max = maxTasks
+        val waitSec = dwell
+        val removeAfterClaim = uninstall
+        val dryRun = dry
+
+        for (attempt in 1..15) {
+            if (latestAckSession == token) {
+                startInProgress = false
+                if (latestPhase.contains("等待福利中心页面")) {
+                    push("! 云服务进程已连接，但尚未检测到福利中心网页；进入福利中心后模块会自动继续。")
+                } else {
+                    push("✓ 已收到云服务回执：" + latestPhase)
+                }
+                return@LaunchedEffect
+            }
+
+            val command = Intent(State.ACT_START)
+                .setPackage(State.TARGET_PKG)
+                .putExtra("session", token)
+                .putExtra("max", max)
+                .putExtra("dwell", waitSec)
+                .putExtra("uninstall", removeAfterClaim)
+                .putExtra("dry", dryRun)
+            runCatching { ctx.sendBroadcast(command) }
+                .onFailure { if (attempt == 1) push("! 发送启动指令失败: " + it.message) }
+
+            if (attempt == 1) {
+                push("→ 正在等待云服务 Hook 接收器（自动重试，最多 15 秒）")
+            }
+            delay(1000)
+        }
+
+        startInProgress = false
+        if (latestAckSession != token) {
+            push("! 已自动拉起云服务，但 15 秒内未收到 Hook 回执。请检查 LSPosed 模块是否启用、作用域是否包含 com.heytap.cloud，并强行停止后重开云服务。")
         }
     }
 
@@ -182,17 +222,23 @@ fun ControlScreen() {
         val token = UUID.randomUUID().toString()
         sessionToken = token
         lastAck = 0L
+        lastAckSession = ""
         running = false
-        phase = "等待云服务回执"
-        val i = Intent(State.ACT_START)
-            .setPackage(State.TARGET_PKG)
-            .putExtra("session", token)
-            .putExtra("max", maxTasks)
-            .putExtra("dwell", dwell)
-            .putExtra("uninstall", uninstall)
-            .putExtra("dry", dry)
-        runCatching { ctx.sendBroadcast(i) }
-            .onFailure { push("! 发送失败: " + it.message) }
+        phase = "正在启动云服务"
+        startInProgress = true
+
+        val launchIntent = runCatching {
+            ctx.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
+        }.getOrNull()
+        if (launchIntent == null) {
+            push("! 找不到云服务 App 的启动入口；仍会尝试发送控制指令。")
+        } else {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            runCatching { ctx.startActivity(launchIntent) }
+                .onSuccess { push("→ 已请求自动启动云服务") }
+                .onFailure { push("! 自动启动云服务失败: " + (it.message ?: it.javaClass.simpleName)) }
+        }
+
         push("→ START max=" + maxTasks + " dwell=" + dwell +
             " uninstall=" + uninstall + " dry=" + dry)
         startTick++
@@ -281,10 +327,10 @@ fun ControlScreen() {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(
                     onClick = { sendStart() },
-                    enabled = !running,
+                    enabled = !running && !startInProgress,
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(16.dp),
-                ) { Text(if (running) "运行中…" else "开始自动完成") }
+                ) { Text(when { running -> "运行中…"; startInProgress -> "正在连接云服务…"; else -> "开始自动完成" }) }
 
                 FilledTonalButton(
                     onClick = { sendStop() },
@@ -326,7 +372,7 @@ fun ControlScreen() {
             CardBox("运行日志") {
                 if (logs.isEmpty()) {
                     Text(
-                        "还没有日志。先打开云服务进入福利中心，再点「开始自动完成」。",
+                        "点击「开始自动完成」会自动启动云服务；如需进入福利中心，日志会明确提示。",
                         color = MaterialTheme.colorScheme.outline,
                         style = MaterialTheme.typography.bodySmall,
                     )

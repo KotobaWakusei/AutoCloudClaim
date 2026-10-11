@@ -370,6 +370,13 @@ object Injector {
                     "[AutoCloud][JSProbe] script result=${result ?: "null"} url=$url"
                 )
                 XposedBridge.log("[AutoCloud] attached $url")
+                if (result?.contains("injected") == true && result?.contains("inject-error") != true) {
+                    State.publish(
+                        wv.context.applicationContext,
+                        phase = if (State.running) "福利中心页面已就绪" else "福利中心页面已检测到",
+                        line = "福利中心 WebView 已挂载并完成脚本注入",
+                    )
+                }
             }
         } catch (t: Throwable) {
             XposedBridge.log(
@@ -454,9 +461,18 @@ object Trigger {
                     "[AutoCloud] START max=${State.maxTasks} dwell=${State.dwellSec}" +
                         " uninstall=${State.autoUninstall} dry=${State.dryRun}"
                 )
+                val pageReady = runCatching {
+                    State.injected.any { webView -> webView.url?.contains("/profit/") == true }
+                }.getOrDefault(false)
+                val phase = when {
+                    State.dryRun && pageReady -> "演示模式 · 福利中心页面已检测到"
+                    State.dryRun -> "演示模式 · 等待福利中心页面"
+                    pageReady -> "福利中心页面已检测到"
+                    else -> "云服务已连接 · 等待福利中心页面"
+                }
                 State.publish(
                     ctx,
-                    phase = if (State.dryRun) "演示模式" else "运行中",
+                    phase = phase,
                     line = "收到 START（max=" + State.maxTasks +
                         " dwell=" + State.dwellSec + " uninstall=" + State.autoUninstall + "）",
                 )
