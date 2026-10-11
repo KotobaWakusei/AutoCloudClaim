@@ -107,34 +107,32 @@ class Bridge(private val wv: WebView) {
         ""
     }
 
-    /** 拉起应用：Bridge 调用不能同步等待主线程，否则容易形成 WebView/主线程死锁。 */
+    /** 异步排队拉起应用；返回值只表示任务是否成功入队，不代表 Activity 已成功启动。 */
     @JavascriptInterface
     fun launch(pkg: String): Boolean {
         if (!isValidPackage(pkg)) return false
         val intent = runCatching { app.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
             ?: return false
-        main.post {
+        return main.post {
             runCatching {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 app.startActivity(intent)
             }.onFailure { XposedBridge.log("[AutoCloud] launch failed: " + it) }
         }
-        return true
     }
 
-    /** 把云服务 App 拉回前台；异步执行，不阻塞 JS Bridge 线程。 */
+    /** 异步将云服务 App 排队切回前台；返回值只表示任务是否成功入队。 */
     @JavascriptInterface
     fun bringToFront(): Boolean {
         val intent = runCatching {
             app.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
         }.getOrNull() ?: return false
-        main.post {
+        return main.post {
             runCatching {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
                 app.startActivity(intent)
             }.onFailure { XposedBridge.log("[AutoCloud] bringToFront failed: " + it) }
         }
-        return true
     }
 
     /**
