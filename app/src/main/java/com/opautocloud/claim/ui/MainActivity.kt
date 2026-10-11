@@ -157,7 +157,7 @@ fun ControlScreen() {
             }
         }
         val filter = IntentFilter(State.ACT_STATUS)
-        val flags = if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_EXPORTED else 0
+        val flags = if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_NOT_EXPORTED else 0
         ctx.registerReceiver(receiver, filter, flags)
         onDispose { runCatching { ctx.unregisterReceiver(receiver) } }
     }
