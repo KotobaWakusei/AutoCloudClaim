@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - "**"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -35,13 +38,14 @@ jobs:
           gradle-version: "8.14.5"
 
       - name: Decode keystore
+        if: ${{ secrets.KEYSTORE_B64 != '' }}
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
         run: echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/autocloud.jks"
 
       - name: Build release APK
         env:
-          KEYSTORE_FILE: ${{ runner.temp }}/autocloud.jks
+          KEYSTORE_FILE: ${{ secrets.KEYSTORE_B64 != '' && format('{0}/autocloud.jks', runner.temp) || '' }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
