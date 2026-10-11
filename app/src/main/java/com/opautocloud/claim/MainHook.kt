@@ -124,6 +124,14 @@ class MainHook : IXposedHookLoadPackage {
         XposedHelpers.findAndHookMethod(
             WebView::class.java, "loadUrl", String::class.java,
             object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val wv = param.thisObject as WebView
+                    val url = param.args[0] as? String ?: return
+                    // JavaScript interfaces added after onPageFinished are not exposed to the
+                    // current document until a subsequent navigation. Install before loadUrl.
+                    Injector.prepareForNavigation(wv, url)
+                }
+
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val wv = param.thisObject as WebView
                     State.main.postDelayed({ tryAttach(wv) }, 1500)
@@ -245,6 +253,21 @@ object Injector {
     private const val MAX_PROBE_ATTEMPTS = 6
     private val probeDelaysMs = longArrayOf(0L, 200L, 500L, 1000L, 2000L, 4000L)
     private val attachedUrls = WeakHashMap<WebView, String>()
+
+    /**
+     * Must run before the profit document starts loading. Android WebView only exposes a newly
+     * added JavascriptInterface to a document after navigation; attaching it in onPageFinished
+     * leaves window.autocloud undefined for the already-loaded page.
+     */
+    fun prepareForNavigation(wv: WebView, url: String) {
+        if (!url.contains("/profit/")) return
+        try {
+            wv.addJavascriptInterface(Bridge(wv), "autocloud")
+            XposedBridge.log("[AutoCloud] bridge prepared before navigation url=$url")
+        } catch (t: Throwable) {
+            XposedBridge.log("[AutoCloud] pre-navigation bridge install failed: " + t)
+        }
+    }
 
     fun attach(wv: WebView, url: String) {
         State.main.post {
