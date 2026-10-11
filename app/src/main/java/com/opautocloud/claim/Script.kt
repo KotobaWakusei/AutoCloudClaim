@@ -254,17 +254,20 @@ object Script {
         await sleep(sec * 1000);
 
         // 返回云服务后，SDK 会在 Activity.onResume 回调中给出 duration/timeLeft。
-        var resultBefore = B.sdkTrackVersion();
+        // Use the version captured before clicking OPEN. The SDK result can arrive
+        // while the external app is foregrounded, before this WebView resumes.
+        // Comparing against a snapshot taken here would miss that already-delivered result.
         B.bringToFront();
 
         var sdkVerified = false;
         var left = -1;
         for (var resultWait = 0; resultWait < 80; resultWait++) {
-          await sleep(100);
           var resultNow = B.sdkTrackVersion();
-          if (resultNow > resultBefore) {
-            left = B.sdkTrackTimeLeftSec();
-            var duration = B.sdkTrackDurationSec();
+          var duration = B.sdkTrackDurationSec();
+          left = B.sdkTrackTimeLeftSec();
+          // A start-tracking callback also bumps the version. Only accept an actual
+          // result payload, not the start event or stale values from a previous task.
+          if (resultNow > trackBefore && duration >= 0 && left >= 0) {
             log('SDK timing result package=' + B.sdkTrackPackage() +
                 ' duration=' + duration + 's timeLeft=' + left + 's');
             if (left <= 0) {
@@ -275,6 +278,7 @@ object Script {
             }
             break;
           }
+          await sleep(100);
         }
 
         if (!sdkVerified) {
