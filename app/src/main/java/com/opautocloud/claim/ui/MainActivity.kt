@@ -185,6 +185,7 @@ fun ControlScreen() {
         val removeAfterClaim = uninstall
         val dryRun = dry
 
+        var launchAttempted = false
         for (attempt in 1..15) {
             if (latestAckSession == token) {
                 startInProgress = false
@@ -194,6 +195,22 @@ fun ControlScreen() {
                     push("✓ 已收到云服务回执：" + latestPhase)
                 }
                 return@LaunchedEffect
+            }
+
+            // Give an already-running cloud process two seconds to answer before foregrounding it.
+            if (attempt == 3 && !launchAttempted) {
+                launchAttempted = true
+                val launchIntent = runCatching {
+                    ctx.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
+                }.getOrNull()
+                if (launchIntent == null) {
+                    push("! 找不到云服务 App 的启动入口；继续重试控制指令。")
+                } else {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    runCatching { ctx.startActivity(launchIntent) }
+                        .onSuccess { push("→ 前两次未收到回执，已自动拉起云服务") }
+                        .onFailure { push("! 自动拉起云服务失败: " + (it.message ?: it.javaClass.simpleName)) }
+                }
             }
 
             val command = Intent(State.ACT_START)
@@ -226,18 +243,6 @@ fun ControlScreen() {
         running = false
         phase = "正在启动云服务"
         startInProgress = true
-
-        val launchIntent = runCatching {
-            ctx.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
-        }.getOrNull()
-        if (launchIntent == null) {
-            push("! 找不到云服务 App 的启动入口；仍会尝试发送控制指令。")
-        } else {
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            runCatching { ctx.startActivity(launchIntent) }
-                .onSuccess { push("→ 已请求自动启动云服务") }
-                .onFailure { push("! 自动启动云服务失败: " + (it.message ?: it.javaClass.simpleName)) }
-        }
 
         push("→ START max=" + maxTasks + " dwell=" + dwell +
             " uninstall=" + uninstall + " dry=" + dry)
