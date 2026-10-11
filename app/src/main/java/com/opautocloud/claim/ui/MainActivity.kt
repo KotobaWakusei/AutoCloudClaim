@@ -38,6 +38,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
@@ -63,8 +64,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.opautocloud.claim.BuildConfig
 import com.opautocloud.claim.State
+import com.opautocloud.claim.UpdateChecker
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 // ---------------------------------------------------------------- 主题
@@ -131,6 +136,11 @@ fun ControlScreen() {
     var tick by remember { mutableIntStateOf(0) }
     val logs = remember { mutableStateListOf<String>() }
 
+    // GitHub 更新检查
+    var updateResult by remember { mutableStateOf<UpdateChecker.Result?>(null) }
+    var updateDismissed by rememberSaveable { mutableStateOf(false) }
+    var updateChecking by remember { mutableStateOf(false) }
+
     fun push(line: String) {
         logs.add(0, line)
         while (logs.size > 200) logs.removeAt(logs.lastIndex)
@@ -141,6 +151,19 @@ fun ControlScreen() {
         while (true) {
             delay(1000)
             tick++
+        }
+    }
+
+    // 启动时检查 GitHub 更新
+    LaunchedEffect(Unit) {
+        updateChecking = true
+        val result = withContext(Dispatchers.IO) {
+            runCatching { UpdateChecker.check(BuildConfig.BUILD_NUMBER) }.getOrNull()
+        }
+        updateChecking = false
+        if (result != null && result.hasUpdate) {
+            updateResult = result
+            push("↑ 发现新版本 " + result.latestTag + "（当前 build-" + BuildConfig.BUILD_NUMBER + "）")
         }
     }
     // tick 在组合里被读取一次，才能让「已连接」按秒自动过期
@@ -333,6 +356,26 @@ fun ControlScreen() {
                     Spacer(Modifier.width(12.dp))
                     Metric("碎片", fragments.toString())
                 }
+            }
+
+            // ---- 更新提示 ----
+            if (!updateDismissed && updateResult != null) {
+                Spacer(Modifier.height(8.dp))
+                UpdateBanner(
+                    result = updateResult!!,
+                    currentBuild = BuildConfig.BUILD_NUMBER,
+                    onOpen = {
+                        UpdateChecker.openReleasePage(ctx, updateResult!!.releaseUrl)
+                    },
+                    onDismiss = { updateDismissed = true },
+                )
+            } else if (updateChecking) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "正在检查更新…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
             }
 
             Spacer(Modifier.height(12.dp))
@@ -545,5 +588,59 @@ private fun SwitchRow(
         }
         Spacer(Modifier.width(12.dp))
         Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+@Composable
+private fun UpdateBanner(
+    result: UpdateChecker.Result,
+    currentBuild: Int,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "↑ 发现新版本",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onDismiss) {
+                    Text(
+                        "忽略",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.6f),
+                    )
+                }
+            }
+            Text(
+                result.latestTag + "（当前 build-" + currentBuild + "）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+            )
+            if (result.releaseName.isNotBlank() && result.releaseName != result.latestTag) {
+                Text(
+                    result.releaseName,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.6f),
+                    maxLines = 2,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = onOpen,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("前往下载") }
+        }
     }
 }

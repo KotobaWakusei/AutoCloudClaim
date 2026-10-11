@@ -84,6 +84,9 @@ Compose BOM 2024.09.03 / Material 3 / activity-compose 1.9.2，compileSdk 34，m
 │ AutoCloud Claim            ● 已连接    │  ← 顶栏：连接指示 + 当前阶段
 │ 已连接 · 领取成功 · 120 碎片            │
 ├───────────────────────────────────────┤
+│ ↑ 发现新版本 build-48（当前 build-47） │  ← 有新 release 时显示
+│ [          前往下载          ] [ 忽略 ] │
+├───────────────────────────────────────┤
 │ [ ● 运行中 ]  已领取      碎片          │  ← 状态卡
 │                1 次      120           │
 │ [   开始自动完成   ] [   停止   ]        │
@@ -102,6 +105,10 @@ Compose BOM 2024.09.03 / Material 3 / activity-compose 1.9.2，compileSdk 34，m
 └───────────────────────────────────────┘
 ```
 
+**更新检查**：启动时自动查询 GitHub Releases（`api.github.com/repos/…/releases/latest`），
+有新版本时显示提示卡片，点「前往下载」跳转浏览器。CI 构建会注入 `-PbuildNumber=N`，
+与 release tag `build-N` 比较；本地开发构建 buildNumber=0，永远提示有更新（可点「忽略」关闭）。
+
 通信方式（控制指令受权限保护）：
 
 - **面板 → 云服务**：`START/STOP` 使用显式目标包，并携带每次运行生成的随机会话令牌；
@@ -117,7 +124,10 @@ Compose BOM 2024.09.03 / Material 3 / activity-compose 1.9.2，compileSdk 34，m
 
 1. 设好 `max / dwell / uninstall / dry`，直接点 **开始自动完成**。
 2. 面板先尝试与已运行的云服务进程握手；前两次没有回执时才自动拉起云服务，并重试启动指令，直到 Hook 接收器回执或等待超时。
-3. 日志会区分「云服务进程已连接」和「福利中心页面已检测到/已就绪」；若停在等待页面，进入福利中心后会自动继续。
+3. **START 后模块会自动导航到福利中心**：Hook 在宿主进程内调用 app 自己的打开方法
+   （`wo.c` 构建 URL → `yl.d.r()` 启动 `CloudWebBusinessActivity`），无需手动进入。
+   日志出现 `[AutoNav] navigation triggered` 即跳转成功；若失败会自动重试（最多 12 次，
+   间隔 2 秒），超时后提示「请手动进入」。
 4. 看日志滚动态，随时 **停止**。云服务进程即使已被强停，「停止」也会先在本地复位，不会把「开始」按钮锁死。
 
 ## 使用（adb / 命令行，备选）
@@ -188,7 +198,8 @@ H5 是 Vite + Vue3，卡片类名来自 CSS module（抓到过的有
 | 现象 | 日志特征 | 原因与处理 |
 |---|---|---|
 | 点开始后面板一直转 | 无 `control trigger receiver registered` | LSPosed 未启用模块或作用域没勾 `com.heytap.cloud`。强停云服务重开 |
-| 连上了但页面不动 | `云服务已连接 · 等待福利中心页面` | 还没进福利中心。点「打开云服务 · 去福利中心」 |
+| 自动跳转没生效 | `[AutoNav] welfare center URL not ready` 反复出现 | 宿主云配置（`cloudconfig.g()`）还没加载完，等几秒再试；若一直失败，手动进福利中心 |
+| 连上了但页面不动 | `[AutoNav] gave up after 12 attempts` | 自动跳转重试耗尽。点「打开云服务 · 去福利中心」或手动进入 |
 | 脚本挂了、日志停住 | `[AutoCloud][JS] FATAL loop error: …` | 注入脚本抛异常。把这行贴出来，多半是页面结构变了 |
 | 按钮一个都没点 | 有 `START` 但没有 `click …`，且 `action-candidates` 里有没见过的文案 | 文案对不上四个正则 → 按上一节校准 |
 | 碎片数一直是 0 | `counter=MISSING` | 碎片元素选择器变了。补 `FRAG_SEL`；期间确认会退化为「按钮消失/完成态文案」这一条 DOM 通道 |
@@ -253,6 +264,15 @@ adb logcat -s LSPosed-Bridge:V | grep AutoCloud
 `State.isProfitUrl()` 要求路径里出现 `/profit` 且后面是结束、`/`、`?` 或 `#`，
 兼容 SPA 子路由与无尾斜杠，同时排除 `/profits` 之类误匹配。
 
+**自动导航**（`AutoNav` 对象）：START 后若不在福利中心页，Hook 在宿主进程内自动跳转。
+链路（反编译确认）：`wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER)` 构建 URL
+（路径固定 `/cloud/welfarecenter.html`，域名来自服务端 `cloudconfig.g()`），
+再调 `yl.d.f41385g.r(activity, url)` → 经 `zl.c` / `fo.a.g` / `WebProvider`
+启动 `CloudWebBusinessActivity`。`CloudWebBusinessActivity` 虽 `exported=false`，
+但 Hook 跑在 `com.heytap.cloud` 同进程同 UID，可直接调用。
+Activity 前台化由 `Application.ActivityLifecycleCallbacks` 跟踪；
+URL 未就绪（云配置未加载）时每 2 秒重试，最多 12 次；进入福利中心页后自动取消。
+
 **执行结构**：
 ```
 loop()          ← try/finally 复位 S.run，异常不会让脚本假死
@@ -271,9 +291,10 @@ app/src/main/assets/xposed_init            模块入口类名
 app/src/main/res/values/arrays.xml         xposed_scope = com.heytap.cloud
 app/src/main/res/values[-night]/themes.xml Material 系统主题（配 edge-to-edge）
 app/src/main/java/com/opautocloud/claim/
-├── MainHook.kt         入口：State(含 publish) / Trigger / Injector + 三个 hook
+├── MainHook.kt         入口：State(含 publish) / AutoNav / Trigger / Injector + 三个 hook
 ├── Bridge.kt           JS 桥 window.autocloud（状态查询 + 启动/延时返回/卸载 + status 上报）
 ├── Script.kt           注入的自动化脚本（任务状态机循环 + 冷却 + 三重领取确认）
+├── UpdateChecker.kt    GitHub Release 更新检查（查询 latest release tag）
 └── ui/MainActivity.kt  Material 3 控制面板（Compose）
 ```
 

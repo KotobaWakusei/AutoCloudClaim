@@ -14,6 +14,8 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        // CI 用 -PbuildNumber=N 注入；本地默认 0，始终提示有更新（可手动关闭）
+        buildConfigField("int", "BUILD_NUMBER", (findProperty("buildNumber") as? String) ?: "0")
     }
 
     // CI 通过环境变量提供正式签名（GitHub Secrets）；本地没配时退回 debug 签名，保证能直接 assembleInstall
@@ -40,6 +42,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

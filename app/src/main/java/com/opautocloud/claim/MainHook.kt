@@ -1,10 +1,12 @@
 package com.opautocloud.claim
 
+import android.app.Activity
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
@@ -13,6 +15,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.UUID
@@ -116,10 +119,135 @@ object State {
     }
 }
 
+/**
+ * 自动导航到福利中心。
+ *
+ * 反编译核对（云服务 11.3.5）：
+ *  - 福利中心 URL 由 wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER) 构建，
+ *    路径固定 "/cloud/welfarecenter.html"，域名来自服务端 cloudconfig.g()（webH5Url）。
+ *  - 首页菜单点击最终调 yl.d.f41385g.r(activity, url)，经 zl.c → fo.a.g → WebProvider
+ *    启动 CloudWebBusinessActivity（extra_url）。CloudWebBusinessActivity 虽 exported=false，
+ *    但 hook 跑在 com.heytap.cloud 同进程同 UID，可直接调用。
+ *  - 模块运行在宿主进程内，因此可在 START 后自动触发这条导航，用户无需手动进入福利中心。
+ *
+ * 触发时机：收到 START 且当前不在福利中心页时，等宿主 Activity 前台化后自动跳转。
+ */
+object AutoNav {
+    private const val MAX_ATTEMPTS = 12
+    private const val RETRY_DELAY_MS = 2_000L
+
+    @Volatile private var pending = false
+    @Volatile private var attempts = 0
+    @Volatile private var classLoader: ClassLoader? = null
+    @Volatile private var currentActivity: WeakReference<Activity>? = null
+
+    fun bindClassLoader(cl: ClassLoader) {
+        classLoader = cl
+    }
+
+    fun onActivityResumed(activity: Activity) {
+        currentActivity = WeakReference(activity)
+        if (pending) tryNavigate()
+    }
+
+    fun requestNavigate() {
+        pending = true
+        attempts = 0
+        State.main.postDelayed({ tryNavigate() }, 1_000L)
+    }
+
+    fun cancel() {
+        pending = false
+        attempts = 0
+    }
+
+    private fun tryNavigate() {
+        if (!pending || !State.running) return
+
+        val onProfit = runCatching {
+            State.injected.any { State.isProfitUrl(it.url) }
+        }.getOrDefault(false)
+        if (onProfit) {
+            pending = false
+            XposedBridge.log("[AutoNav] already on welfare center page, skip navigation")
+            return
+        }
+
+        if (attempts >= MAX_ATTEMPTS) {
+            pending = false
+            XposedBridge.log("[AutoNav] gave up after $MAX_ATTEMPTS attempts")
+            State.publish(
+                currentActivity?.get() ?: return,
+                phase = "自动跳转福利中心失败，请手动进入",
+                line = "AutoNav: 已达最大重试次数",
+            )
+            return
+        }
+        attempts++
+
+        val activity = currentActivity?.get()
+        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            return
+        }
+
+        val cl = classLoader
+        if (cl == null) {
+            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            return
+        }
+
+        val url = runCatching { welfareCenterUrl(cl) }.getOrNull()
+        if (url.isNullOrBlank()) {
+            XposedBridge.log("[AutoNav] welfare center URL not ready (attempt $attempts), retry")
+            State.publish(activity, phase = "等待福利中心配置加载…")
+            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            return
+        }
+
+        val ok = runCatching { openUrl(cl, activity, url) }.getOrElse {
+            XposedBridge.log("[AutoNav] open failed: " + it.stackTraceToString())
+            false
+        }
+        if (ok) {
+            pending = false
+            XposedBridge.log("[AutoNav] navigation triggered url=$url")
+            State.publish(
+                activity,
+                phase = "正在自动进入福利中心…",
+                line = "AutoNav: 已触发跳转",
+            )
+        } else {
+            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+        }
+    }
+
+    /** wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER) */
+    private fun welfareCenterUrl(cl: ClassLoader): String? {
+        val woC = XposedHelpers.findClass("wo.c", cl)
+        val instance = XposedHelpers.getStaticObjectField(woC, "f40427f")
+        val urlTypeCl = XposedHelpers.findClass(
+            "com.heytap.cloud.server.config.module.url.WebUrlConstants\$UrlType", cl
+        )
+        val welfare = XposedHelpers.getStaticObjectField(urlTypeCl, "WELFARE_CENTER")
+        return XposedHelpers.callMethod(instance, "q", welfare) as? String
+    }
+
+    /** yl.d.f41385g.r(activity, url) */
+    private fun openUrl(cl: ClassLoader, activity: Activity, url: String): Boolean {
+        val ylD = XposedHelpers.findClass("yl.d", cl)
+        val manager = XposedHelpers.getStaticObjectField(ylD, "f41385g")
+        XposedHelpers.callMethod(manager, "r", activity, url)
+        return true
+    }
+}
+
 class MainHook : IXposedHookLoadPackage {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != State.TARGET_PKG) return
+
+        AutoNav.bindClassLoader(lpparam.classLoader)
 
         // 1) 注册手动触发的广播（在目标 App 进程里动态注册，避免给模块自己加组件）
         //    attach() 是 Application 的 final 方法，必定被 ActivityThread 调用，比 onCreate 可靠
@@ -129,6 +257,17 @@ class MainHook : IXposedHookLoadPackage {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val app = param.thisObject as Application
                     Trigger.register(app)
+                    app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+                        override fun onActivityResumed(activity: Activity) {
+                            AutoNav.onActivityResumed(activity)
+                        }
+                        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+                        override fun onActivityStarted(activity: Activity) {}
+                        override fun onActivityPaused(activity: Activity) {}
+                        override fun onActivityStopped(activity: Activity) {}
+                        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+                        override fun onActivityDestroyed(activity: Activity) {}
+                    })
                 }
             }
         )
@@ -146,7 +285,10 @@ class MainHook : IXposedHookLoadPackage {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val wv = param.args[0] as? WebView ?: return
                     val url = param.args[1] as? String ?: return
-                    if (State.isProfitUrl(url)) Injector.attach(wv, url)
+                    if (State.isProfitUrl(url)) {
+                        AutoNav.cancel()
+                        Injector.attach(wv, url)
+                    }
                 }
             }
         )
@@ -555,7 +697,10 @@ object Trigger {
                     State.dryRun && pageReady -> "演示模式 · 福利中心页面已检测到"
                     State.dryRun -> "演示模式 · 等待福利中心页面"
                     pageReady -> "福利中心页面已检测到"
-                    else -> "云服务已连接 · 等待福利中心页面"
+                    else -> "正在自动进入福利中心…"
+                }
+                if (!pageReady) {
+                    AutoNav.requestNavigate()
                 }
                 State.publish(
                     ctx,
@@ -575,6 +720,7 @@ object Trigger {
                     return
                 }
                 State.running = false
+                AutoNav.cancel()
                 XposedBridge.log("[AutoCloud] STOP")
                 State.publish(ctx, phase = "已停止", line = "收到 STOP")
                 State.sessionToken = ""

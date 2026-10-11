@@ -7,6 +7,9 @@
         android:protectionLevel="signature" />
     <uses-permission android:name="com.opautocloud.claim.permission.CONTROL" />
 
+    <!-- 控制面板检查 GitHub 更新 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- 只对本模块自己的进程生效（给控制面板用）。
          注意：Hook 与 JS 桥运行在 com.heytap.cloud 进程里，那里读 PackageManager 受的是
          云服务自己的 manifest 约束，这里的 <queries> 帮不上忙。
