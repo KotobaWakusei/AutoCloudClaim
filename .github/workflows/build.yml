@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - "**"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -34,14 +37,21 @@ jobs:
         with:
           gradle-version: "8.14.5"
 
-      - name: Decode keystore
+      - name: Decode keystore when available
+        id: signing
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-        run: echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/autocloud.jks"
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/autocloud.jks"
+            echo "has_keystore=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_keystore=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build release APK
         env:
-          KEYSTORE_FILE: ${{ runner.temp }}/autocloud.jks
+          KEYSTORE_FILE: ${{ steps.signing.outputs.has_keystore == 'true' && format('{0}/autocloud.jks', runner.temp) || '' }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
