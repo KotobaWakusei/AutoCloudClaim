@@ -243,6 +243,9 @@ fun ControlScreen() {
         running = false
         phase = "正在启动云服务"
         startInProgress = true
+        // 新一轮开始：清掉上一轮的计数，避免状态卡长期显示旧值
+        claimed = 0
+        fragments = 0
 
         push("→ START max=" + maxTasks + " dwell=" + dwell +
             " uninstall=" + uninstall + " dry=" + dry)
@@ -260,6 +263,12 @@ fun ControlScreen() {
             .putExtra("session", token)
         runCatching { ctx.sendBroadcast(i) }
             .onFailure { push("! 停止失败: " + it.message) }
+        // 先本地复位：云服务进程若已被强停就收不到回执，
+        // 不复位的话 running 永远为 true，「开始」按钮会被永久锁死。
+        // 云端若其实还活着，它下一次 status 回执会把 running 重新置真。
+        running = false
+        startInProgress = false
+        phase = "已停止"
         push("→ STOP")
     }
 

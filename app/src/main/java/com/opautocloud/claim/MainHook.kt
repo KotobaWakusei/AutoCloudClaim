@@ -44,8 +44,23 @@ object State {
     @Volatile var autoUninstall = false
     @Volatile var dryRun = false
 
-    // 11.3.5 TaskWall SDK 的 H5 结果回执：code=13097 为成功路径。
-    const val TASKWALL_SUCCESS_CODE = 13097
+    /**
+     * 11.3.5 TaskWall SDK 的 H5 结果回执。
+     *
+     * 成功码经反编译核对（云服务 11.3.5, TaskWallResultInfoTransferInterceptor → jr/d.java）：
+     *   if (cloudTaskWallH5ResultD.f14358b == 200) { aVar.b(); } else { aVar.fail(...); }
+     *   this.f28194a.send(cloudTaskWallH5ResultD.f14358b, bundleE);
+     * 即 `Bundle.getInt("code") == 200` 才是成功路径。此前写成 13097 是误匹配 Material
+     * 资源 ID（R.attr 值域），SDK 回执这条确认通道永远不触发。
+     *
+     * 重要限制：该拦截器（jr/d）只在 `z11 == true` 时注册（ir/e.java:321），
+     * 而 profit 页的 `startCoinTaskWallPage` JS API 走的是 `z11 == false`
+     * （StartCoinTaskWallPage.java:60 → TaskWallProvider.f(..., false)），
+     * 因此这条通道在「点领取」时通常不会触发——领取结果是 H5 直接发 HTTP 到服务端，
+     * 不经过原生桥。领取确认仍以碎片数变化 + 领取按钮消失这两条 DOM 证据为准，
+     * 本 hook 作为 `CloudPermissionRouteActivity` 等 `z11=true` 路径的补充。
+     */
+    const val TASKWALL_SUCCESS_CODE = 200
     @Volatile var taskResultVersion = 0L
     @Volatile var taskResultCode = Int.MIN_VALUE
     @Volatile var taskResultMessage = ""
@@ -61,6 +76,22 @@ object State {
 
     val main = Handler(Looper.getMainLooper())
     val injected: MutableSet<WebView> = Collections.newSetFromMap(WeakHashMap())
+
+    /**
+     * 福利中心 H5 的 URL 判定。
+     *
+     * 路径 `/profit/` 由服务端下发，APK 里没有硬编码（反编译核对无 `profit` 字面量），
+     * 这里按观测到的 `…/profit/index.html` 匹配。SPA 子路由可能是 `…/profit`（无尾斜杠）
+     * 或 `…/profit/detail`，因此只要求路径里出现 `/profit` 这一段即可。
+     */
+    fun isProfitUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val i = url.indexOf("/profit")
+        if (i < 0) return false
+        val end = i + "/profit".length
+        // `/profit` 后面要么结束，要么是 `/`、`?`、`#`，避免误匹配 `/profits` 之类
+        return end >= url.length || url[end] == '/' || url[end] == '?' || url[end] == '#'
+    }
 
     /** 把状态回执广播给控制面板（同 APK 的 ui.MainActivity）。 */
     fun publish(
@@ -115,7 +146,7 @@ class MainHook : IXposedHookLoadPackage {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val wv = param.args[0] as? WebView ?: return
                     val url = param.args[1] as? String ?: return
-                    if (url.contains("/profit/")) Injector.attach(wv, url)
+                    if (State.isProfitUrl(url)) Injector.attach(wv, url)
                 }
             }
         )
@@ -242,7 +273,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun tryAttach(wv: WebView) {
         try {
             val url = wv.url ?: return
-            if (url.contains("/profit/")) Injector.attach(wv, url)
+            if (State.isProfitUrl(url)) Injector.attach(wv, url)
         } catch (t: Throwable) {
             XposedBridge.log(t)
         }
@@ -255,6 +286,16 @@ object Injector {
     private val attachedUrls = WeakHashMap<WebView, String>()
     private val preparedWebViews: MutableSet<WebView> =
         Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
+    private val bridges = WeakHashMap<WebView, Bridge>()
+
+    /**
+     * 每个 WebView 只保留一个 Bridge 实例。
+     *
+     * `addJavascriptInterface` 传同一个对象是幂等的；若每次 loadUrl 都 new 一个，
+     * 旧实例会带着 WebView 引用被丢弃，频繁导航时白白堆积。
+     */
+    private fun bridgeFor(wv: WebView): Bridge =
+        bridges.getOrPut(wv) { Bridge(wv) }
 
     /**
      * Must run before the profit document starts loading. Android WebView only exposes a newly
@@ -262,9 +303,9 @@ object Injector {
      * leaves window.autocloud undefined for the already-loaded page.
      */
     fun prepareForNavigation(wv: WebView, url: String) {
-        if (!url.contains("/profit/")) return
+        if (!State.isProfitUrl(url)) return
         try {
-            wv.addJavascriptInterface(Bridge(wv), "autocloud")
+            wv.addJavascriptInterface(bridgeFor(wv), "autocloud")
             preparedWebViews.add(wv)
             XposedBridge.log("[AutoCloud] bridge prepared before navigation url=$url")
         } catch (t: Throwable) {
@@ -284,7 +325,7 @@ object Injector {
                 // Do not replace a pre-navigation bridge after the document has loaded:
                 // that replacement would itself wait for another navigation to become visible.
                 if (!preparedWebViews.contains(wv)) {
-                    wv.addJavascriptInterface(Bridge(wv), "autocloud")
+                    wv.addJavascriptInterface(bridgeFor(wv), "autocloud")
                     XposedBridge.log("[AutoCloud] bridge installed as post-load fallback url=$current")
                 } else {
                     XposedBridge.log("[AutoCloud] using pre-navigation bridge url=$current")
@@ -302,7 +343,7 @@ object Injector {
         val delay = probeDelaysMs[attempt.coerceIn(0, probeDelaysMs.lastIndex)]
         State.main.postDelayed({
             try {
-                if (wv.url?.contains("/profit/") != true) {
+                if (!State.isProfitUrl(wv.url)) {
                     XposedBridge.log("[AutoCloud] probe skipped: url changed to ${wv.url}")
                     return@postDelayed
                 }
@@ -419,11 +460,12 @@ object Injector {
 }
 
 object Trigger {
-    private var registered = false
+    // 两个接收器各自独立登记。原先包在同一个 runCatching 里，第一个成功、第二个抛异常时
+    // 整体不会被标记为已注册，下次 attach 会把第一个注册两次，START 就被执行两遍。
+    private var controlRegistered = false
+    private var shellRegistered = false
 
     fun register(app: Application) {
-        if (registered) return
-
         fun filter() = IntentFilter().apply {
             addAction(State.ACT_START)
             addAction(State.ACT_STOP)
@@ -432,16 +474,29 @@ object Trigger {
         // The GUI sender must hold our signature permission. Keep a separate DUMP-protected
         // receiver for adb shell/root debugging, so ordinary apps cannot start/stop automation.
         val sdk = android.os.Build.VERSION.SDK_INT
-        runCatching {
-            registerProtectedReceiver(app, Receiver, filter(), State.CONTROL_PERMISSION, sdk)
-            registerProtectedReceiver(
-                app, ShellReceiver, filter(), android.Manifest.permission.DUMP, sdk
-            )
-        }.onSuccess {
-            registered = true
-            XposedBridge.log("[AutoCloud] protected trigger receivers registered")
-        }.onFailure {
-            XposedBridge.log("[AutoCloud] trigger receiver registration failed: " + it)
+
+        if (!controlRegistered) {
+            runCatching {
+                registerProtectedReceiver(app, Receiver, filter(), State.CONTROL_PERMISSION, sdk)
+            }.onSuccess {
+                controlRegistered = true
+                XposedBridge.log("[AutoCloud] control trigger receiver registered")
+            }.onFailure {
+                XposedBridge.log("[AutoCloud] control receiver registration failed: " + it)
+            }
+        }
+
+        if (!shellRegistered) {
+            runCatching {
+                registerProtectedReceiver(
+                    app, ShellReceiver, filter(), android.Manifest.permission.DUMP, sdk
+                )
+            }.onSuccess {
+                shellRegistered = true
+                XposedBridge.log("[AutoCloud] shell trigger receiver registered")
+            }.onFailure {
+                XposedBridge.log("[AutoCloud] shell receiver registration failed: " + it)
+            }
         }
     }
 
@@ -494,7 +549,7 @@ object Trigger {
                         " uninstall=${State.autoUninstall} dry=${State.dryRun}"
                 )
                 val pageReady = runCatching {
-                    State.injected.any { webView -> webView.url?.contains("/profit/") == true }
+                    State.injected.any { webView -> State.isProfitUrl(webView.url) }
                 }.getOrDefault(false)
                 val phase = when {
                     State.dryRun && pageReady -> "演示模式 · 福利中心页面已检测到"

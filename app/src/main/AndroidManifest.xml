@@ -7,7 +7,14 @@
         android:protectionLevel="signature" />
     <uses-permission android:name="com.opautocloud.claim.permission.CONTROL" />
 
-    <!-- Android 11+: expose launcher apps to PackageManager so task-app installation can be detected. -->
+    <!-- 只对本模块自己的进程生效（给控制面板用）。
+         注意：Hook 与 JS 桥运行在 com.heytap.cloud 进程里，那里读 PackageManager 受的是
+         云服务自己的 manifest 约束，这里的 <queries> 帮不上忙。
+
+         11.3.5 实测（反编译核对）：宿主已声明 QUERY_ALL_PACKAGES + MAIN/LAUNCHER intent 查询，
+         所以 Bridge.installedPackages() 在正常设备上能拿到完整非系统包列表，无需 root。
+         仅当该权限被系统/用户回收时，可见包数会掉到个位数，此时自动退回
+         `su -c pm list packages -3` 作为兜底（见 Bridge.packagesViaShell）。 -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
