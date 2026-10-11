@@ -512,9 +512,16 @@ object Injector {
                     val result = raw ?: "null"
                     XposedBridge.log("[AutoCloud][JSProbe] attempt=$attempt result=$result")
 
-                    if (raw == null || raw == "null" ||
-                        (!raw.contains("\"bridge\":\"object\"") &&
-                         !raw.contains("\"bridge\": \"object\""))) {
+                    // evaluateJavascript 回调的 raw 是 JSON 编码后的字符串：
+                    // JS 返回 "{\"bridge\":\"object\"}" 时，raw 实际内容是
+                    // "\"{\\\"bridge\\\":\\\"object\\\"}\""，
+                    // 因此必须匹配带反斜杠的转义形式。
+                    val hasBridge =
+                        raw.contains("\\\"bridge\\\":\\\"object\\\"") ||
+                        raw.contains("\\\"bridge\\\": \\\"object\\\"") ||
+                        raw.contains("\"bridge\":\"object\"") ||
+                        raw.contains("\"bridge\": \"object\"")
+                    if (raw == null || raw == "null" || !hasBridge) {
                         if (attempt + 1 < MAX_PROBE_ATTEMPTS) {
                             XposedBridge.log(
                                 "[AutoCloud][JSProbe] bridge not ready; retry " +
