@@ -179,6 +179,11 @@ class MainHook : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         State.sdkTrackPackage = param.args[1] as? String ?: ""
                         State.sdkTrackRequiredSec = (param.args[2] as? Int) ?: -1
+                        // Clear the previous task's result before starting a new timing session.
+                        // Otherwise the JS bridge could mistake stale duration/timeLeft values
+                        // for a fresh completion when only the start callback has fired.
+                        State.sdkTrackDurationSec = -1L
+                        State.sdkTrackTimeLeftSec = -1L
                         State.sdkTrackVersion = System.nanoTime()
                         XposedBridge.log(
                             "[AutoCloud] SDK tracking package=" + State.sdkTrackPackage +
