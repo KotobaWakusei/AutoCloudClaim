@@ -253,6 +253,8 @@ object Injector {
     private const val MAX_PROBE_ATTEMPTS = 6
     private val probeDelaysMs = longArrayOf(0L, 200L, 500L, 1000L, 2000L, 4000L)
     private val attachedUrls = WeakHashMap<WebView, String>()
+    private val preparedWebViews: MutableSet<WebView> =
+        Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
 
     /**
      * Must run before the profit document starts loading. Android WebView only exposes a newly
@@ -263,6 +265,7 @@ object Injector {
         if (!url.contains("/profit/")) return
         try {
             wv.addJavascriptInterface(Bridge(wv), "autocloud")
+            preparedWebViews.add(wv)
             XposedBridge.log("[AutoCloud] bridge prepared before navigation url=$url")
         } catch (t: Throwable) {
             XposedBridge.log("[AutoCloud] pre-navigation bridge install failed: " + t)
@@ -278,10 +281,16 @@ object Injector {
                     probeAndInject(wv, current, 0)
                     return@post
                 }
-                wv.addJavascriptInterface(Bridge(wv), "autocloud")
+                // Do not replace a pre-navigation bridge after the document has loaded:
+                // that replacement would itself wait for another navigation to become visible.
+                if (!preparedWebViews.contains(wv)) {
+                    wv.addJavascriptInterface(Bridge(wv), "autocloud")
+                    XposedBridge.log("[AutoCloud] bridge installed as post-load fallback url=$current")
+                } else {
+                    XposedBridge.log("[AutoCloud] using pre-navigation bridge url=$current")
+                }
                 attachedUrls[wv] = current
                 State.injected.add(wv)
-                XposedBridge.log("[AutoCloud] bridge installed url=$current")
                 probeAndInject(wv, current, 0)
             } catch (t: Throwable) {
                 XposedBridge.log("[AutoCloud] attach failed url=$url: " + t.stackTraceToString())
