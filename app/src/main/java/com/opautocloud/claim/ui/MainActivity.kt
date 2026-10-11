@@ -52,6 +52,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.opautocloud.claim.State
 import kotlinx.coroutines.delay
+import java.util.UUID
 
 // ---------------------------------------------------------------- 主题
 
@@ -123,6 +125,7 @@ fun ControlScreen() {
     var claimed by remember { mutableIntStateOf(0) }
     var fragments by remember { mutableIntStateOf(0) }
     var lastAck by remember { mutableLongStateOf(0L) }
+    var sessionToken by rememberSaveable { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
     val logs = remember { mutableStateListOf<String>() }
 
@@ -148,6 +151,9 @@ fun ControlScreen() {
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
+                // STATUS is sent from the cloud-service UID, so the receiver must be exported.
+                // Accept only replies carrying the unpredictable token generated for this run.
+                if (sessionToken.isBlank() || i.getStringExtra("session") != sessionToken) return
                 lastAck = System.currentTimeMillis()
                 running = i.getBooleanExtra("running", running)
                 i.getStringExtra("phase")?.let { phase = it }
@@ -157,7 +163,7 @@ fun ControlScreen() {
             }
         }
         val filter = IntentFilter(State.ACT_STATUS)
-        val flags = if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_NOT_EXPORTED else 0
+        val flags = if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_EXPORTED else 0
         ctx.registerReceiver(receiver, filter, flags)
         onDispose { runCatching { ctx.unregisterReceiver(receiver) } }
     }
@@ -173,8 +179,14 @@ fun ControlScreen() {
     }
 
     fun sendStart() {
+        val token = UUID.randomUUID().toString()
+        sessionToken = token
+        lastAck = 0L
+        running = false
+        phase = "等待云服务回执"
         val i = Intent(State.ACT_START)
             .setPackage(State.TARGET_PKG)
+            .putExtra("session", token)
             .putExtra("max", maxTasks)
             .putExtra("dwell", dwell)
             .putExtra("uninstall", uninstall)
@@ -187,8 +199,16 @@ fun ControlScreen() {
     }
 
     fun sendStop() {
-        val i = Intent(State.ACT_STOP).setPackage(State.TARGET_PKG)
+        val token = sessionToken
+        if (token.isBlank()) {
+            push("! 当前没有可停止的运行会话")
+            return
+        }
+        val i = Intent(State.ACT_STOP)
+            .setPackage(State.TARGET_PKG)
+            .putExtra("session", token)
         runCatching { ctx.sendBroadcast(i) }
+            .onFailure { push("! 停止失败: " + it.message) }
         push("→ STOP")
     }
 

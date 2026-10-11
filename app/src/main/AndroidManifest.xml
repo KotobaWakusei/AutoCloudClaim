@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Restrict GUI control broadcasts to apps signed with this module's certificate. -->
+    <permission
+        android:name="com.opautocloud.claim.permission.CONTROL"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.opautocloud.claim.permission.CONTROL" />
+
     <!-- Android 11+: expose launcher apps to PackageManager so task-app installation can be detected. -->
     <queries>
         <intent>

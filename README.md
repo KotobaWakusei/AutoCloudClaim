@@ -97,14 +97,15 @@ Compose BOM 2024.09.03 / Material 3 / activity-compose 1.9.2，compileSdk 34，m
 └───────────────────────────────────────┘
 ```
 
-通信方式（不需要任何额外权限）：
+通信方式（控制指令受权限保护）：
 
-- **面板 → 云服务**：`Intent(START/STOP).setPackage("com.heytap.cloud")`，
-  云服务进程内由 Hook 动态注册的 exported receiver 接收
-- **云服务 → 面板**：`Intent(STATUS).setPackage("com.opautocloud.claim")`，
-  携带 `running / phase / claimed / fragments / line`，由 Hook 里的
-  `State.publish()` 和注入脚本的 `B.status()` 推送
-- 面板收到回执刷新顶栏连接点，**12 秒无回执自动置灰**；点「开始」后 3.5 秒
+- **面板 → 云服务**：`START/STOP` 使用显式目标包，并携带每次运行生成的随机会话令牌；
+  接收器要求本模块签名权限，普通第三方 App 无法伪造控制指令
+- **ADB shell/root → 云服务**：保留单独的调试接收器，并要求系统 `DUMP` 权限；
+  命令行会建立独立的 shell 会话，不会冒充控制面板会话
+- **云服务 → 面板**：`STATUS` 广播携带当前会话令牌。由于 Hook 在云服务的 UID 中运行，
+  面板接收器必须导出；面板会拒绝会话令牌不匹配的回执，以阻止普通应用伪造状态
+- 面板收到有效回执刷新顶栏连接点，**12 秒无回执自动置灰**；点「开始」后 3.5 秒
   无回执会在日志里提示「请先打开云服务 App 并进入福利中心」
 
 操作顺序：

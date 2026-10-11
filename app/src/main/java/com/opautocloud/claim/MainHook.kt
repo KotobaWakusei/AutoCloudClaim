@@ -15,6 +15,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.UUID
 
 /**
  * 进程内共享状态。
@@ -33,6 +34,9 @@ object State {
     const val ACT_START = "com.opautocloud.claim.START"
     const val ACT_STOP = "com.opautocloud.claim.STOP"
     const val ACT_STATUS = "com.opautocloud.claim.STATUS"
+    const val CONTROL_PERMISSION = "com.opautocloud.claim.permission.CONTROL"
+
+    @Volatile var sessionToken = ""
 
     @Volatile var running = false
     @Volatile var maxTasks = 3
@@ -68,6 +72,7 @@ object State {
     ) {
         try {
             val i = Intent(ACT_STATUS).setPackage(MODULE_PKG)
+            i.putExtra("session", sessionToken)
             i.putExtra("running", running)
             phase?.let { i.putExtra("phase", it) }
             if (claimed >= 0) i.putExtra("claimed", claimed)
@@ -379,42 +384,97 @@ object Trigger {
 
     fun register(app: Application) {
         if (registered) return
-        registered = true
-        val filter = IntentFilter().apply {
+
+        fun filter() = IntentFilter().apply {
             addAction(State.ACT_START)
             addAction(State.ACT_STOP)
         }
-        // RECEIVER_EXPORTED: 允许 adb/shell(uid 2000) 发送的广播进来
-        val flags = if (android.os.Build.VERSION.SDK_INT >= 33) Context.RECEIVER_EXPORTED else 0
-        app.registerReceiver(Receiver, filter, flags)
-        XposedBridge.log("[AutoCloud] trigger receiver registered")
+
+        // The GUI sender must hold our signature permission. Keep a separate DUMP-protected
+        // receiver for adb shell/root debugging, so ordinary apps cannot start/stop automation.
+        val sdk = android.os.Build.VERSION.SDK_INT
+        runCatching {
+            registerProtectedReceiver(app, Receiver, filter(), State.CONTROL_PERMISSION, sdk)
+            registerProtectedReceiver(
+                app, ShellReceiver, filter(), android.Manifest.permission.DUMP, sdk
+            )
+        }.onSuccess {
+            registered = true
+            XposedBridge.log("[AutoCloud] protected trigger receivers registered")
+        }.onFailure {
+            XposedBridge.log("[AutoCloud] trigger receiver registration failed: " + it)
+        }
+    }
+
+    private fun registerProtectedReceiver(
+        app: Application,
+        receiver: BroadcastReceiver,
+        filter: IntentFilter,
+        permission: String,
+        sdk: Int,
+    ) {
+        if (sdk >= 33) {
+            app.registerReceiver(receiver, filter, permission, null, Context.RECEIVER_EXPORTED)
+        } else {
+            app.registerReceiver(receiver, filter, permission, null)
+        }
     }
 
     private object Receiver : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
-            when (intent.action) {
-                State.ACT_START -> {
-                    State.maxTasks = intent.getIntExtra("max", 3)
-                    State.dwellSec = intent.getIntExtra("dwell", 60)
-                    State.autoUninstall = intent.getBooleanExtra("uninstall", false)
-                    State.dryRun = intent.getBooleanExtra("dry", false)
-                    State.running = true
-                    XposedBridge.log(
-                        "[AutoCloud] START max=${State.maxTasks} dwell=${State.dwellSec}" +
-                            " uninstall=${State.autoUninstall} dry=${State.dryRun}"
-                    )
-                    State.publish(
-                        ctx,
-                        phase = if (State.dryRun) "演示模式" else "运行中",
-                        line = "收到 START（max=" + State.maxTasks +
-                            " dwell=" + State.dwellSec + " uninstall=" + State.autoUninstall + "）",
-                    )
+            handle(ctx, intent, allowShellSession = false)
+        }
+    }
+
+    private object ShellReceiver : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            handle(ctx, intent, allowShellSession = true)
+        }
+    }
+
+    private fun handle(ctx: Context, intent: Intent, allowShellSession: Boolean) {
+        val suppliedSession = intent.getStringExtra("session").orEmpty()
+        when (intent.action) {
+            State.ACT_START -> {
+                val session = when {
+                    suppliedSession.isNotBlank() -> suppliedSession
+                    allowShellSession -> "shell:" + UUID.randomUUID().toString()
+                    else -> {
+                        XposedBridge.log("[AutoCloud] rejected START without session token")
+                        return
+                    }
                 }
-                State.ACT_STOP -> {
-                    State.running = false
-                    XposedBridge.log("[AutoCloud] STOP")
-                    State.publish(ctx, phase = "已停止", line = "收到 STOP")
+                State.sessionToken = session
+                State.maxTasks = intent.getIntExtra("max", 3).coerceIn(1, 10)
+                State.dwellSec = intent.getIntExtra("dwell", 60).coerceIn(15, 300)
+                State.autoUninstall = intent.getBooleanExtra("uninstall", false)
+                State.dryRun = intent.getBooleanExtra("dry", false)
+                State.running = true
+                XposedBridge.log(
+                    "[AutoCloud] START max=${State.maxTasks} dwell=${State.dwellSec}" +
+                        " uninstall=${State.autoUninstall} dry=${State.dryRun}"
+                )
+                State.publish(
+                    ctx,
+                    phase = if (State.dryRun) "演示模式" else "运行中",
+                    line = "收到 START（max=" + State.maxTasks +
+                        " dwell=" + State.dwellSec + " uninstall=" + State.autoUninstall + "）",
+                )
+            }
+            State.ACT_STOP -> {
+                val matchesUiSession =
+                    suppliedSession.isNotBlank() && suppliedSession == State.sessionToken
+                val stopsShellSession =
+                    allowShellSession && suppliedSession.isBlank() &&
+                        State.sessionToken.startsWith("shell:")
+                if (!matchesUiSession && !stopsShellSession) {
+                    XposedBridge.log("[AutoCloud] rejected STOP with stale/missing session")
+                    return
                 }
+                State.running = false
+                XposedBridge.log("[AutoCloud] STOP")
+                State.publish(ctx, phase = "已停止", line = "收到 STOP")
+                State.sessionToken = ""
             }
         }
     }
