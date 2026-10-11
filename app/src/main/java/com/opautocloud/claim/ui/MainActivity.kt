@@ -200,7 +200,8 @@ fun ControlScreen() {
         }
         it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { ctx.startActivity(it) }
-        push("→ 已拉起云服务，请进入「福利中心」")
+            .onSuccess { push("→ 已请求打开云服务，请进入「福利中心」") }
+            .onFailure { push("! 打开云服务失败: " + (it.message ?: it.javaClass.simpleName)) }
     }
 
     Scaffold(
