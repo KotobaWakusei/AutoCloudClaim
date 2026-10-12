@@ -123,9 +123,9 @@ object State {
  * 自动导航到福利中心。
  *
  * 反编译核对（云服务 11.3.5）：
- *  - 福利中心 URL 由 wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER) 构建，
+ *  - 福利中心 URL 由 wo.c.f.q (旧 build 名 f40427f)(WebUrlConstants$UrlType.WELFARE_CENTER) 构建，
  *    路径固定 "/cloud/welfarecenter.html"，域名来自服务端 cloudconfig.g()（webH5Url）。
- *  - 首页菜单点击最终调 yl.d.f41385g.r(activity, url)，经 zl.c → fo.a.g → WebProvider
+ *  - 首页菜单点击最终调 yl.d.g.r (旧 build 名 f41385g)(activity, url)，经 zl.c → fo.a.g → WebProvider
  *    启动 CloudWebBusinessActivity（extra_url）。CloudWebBusinessActivity 虽 exported=false，
  *    但 hook 跑在 com.heytap.cloud 同进程同 UID，可直接调用。
  *  - 模块运行在宿主进程内，因此可在 START 后自动触发这条导航，用户无需手动进入福利中心。
@@ -222,10 +222,53 @@ object AutoNav {
         }
     }
 
-    /** wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER) */
+    /**
+     * 福利中心 URL。
+     *
+     * 与首页菜单 HomePageMenuEntryViewModel.O() 相同的优先级：
+     *  1) 服务端运营位 yl.d.g.h (旧 build 名 f41385g)("10")["keHuDuanFuLiZhongXinRuKouText"].showData.url
+     *  2) 本地兜底 wo.c.f.q (旧 build 名 f40427f)(WELFARE_CENTER)（依赖 cloudconfig 域名，可能为空）
+     *  2026-10-12 真机验证：只走兜底时 cloudconfig.g() 返回空域名，URL 恒为空。
+     */
+    /**
+     * 静态单例字段查找（按候选名依次尝试）。
+     * 2026-10-13 真机验证：设备安装的 11.3.5 build 与手头 jadx 源的混淆名不同——
+     * yl.d 单例是 `g`（jadx 源写 f41385g）、wo.c 单例是 `f`（jadx 源写 f40427f），
+     * 类名/方法名/枚举则完全一致。字段名会随 build 变化，故做多候选兜底。
+     */
+    private fun staticInstance(cl: ClassLoader, className: String, vararg names: String): Any? {
+        val clazz = XposedHelpers.findClass(className, cl)
+        var lastErr: Throwable? = null
+        for (n in names) {
+            val r = runCatching { XposedHelpers.getStaticObjectField(clazz, n) }
+            r.getOrNull()?.let { return it }
+            lastErr = r.exceptionOrNull()
+        }
+        throw lastErr ?: NoSuchFieldError("$className#" + names.joinToString(","))
+    }
+
     private fun welfareCenterUrl(cl: ClassLoader): String? {
-        val woC = XposedHelpers.findClass("wo.c", cl)
-        val instance = XposedHelpers.getStaticObjectField(woC, "f40427f")
+        runCatching {
+            val manager = staticInstance(cl, "yl.d", "g", "f41385g")
+            val map = XposedHelpers.callMethod(manager, "h", "10") as? Map<*, *>
+            val star = map?.get("keHuDuanFuLiZhongXinRuKouText")
+            if (star != null) {
+                val showData = XposedHelpers.callMethod(star, "getShowData")
+                val url = XposedHelpers.callMethod(showData, "getUrl") as? String
+                if (!url.isNullOrBlank()) return url
+            }
+        }.onFailure {
+            XposedBridge.log("[AutoNav] server url lookup failed: " + it)
+        }
+        return runCatching { localWelfareUrl(cl) }.getOrElse {
+            XposedBridge.log("[AutoNav] local url lookup failed: " + it)
+            null
+        }
+    }
+
+    /** wo.c.f.q(WebUrlConstants$UrlType.WELFARE_CENTER) */
+    private fun localWelfareUrl(cl: ClassLoader): String? {
+        val instance = staticInstance(cl, "wo.c", "f", "f40427f")
         val urlTypeCl = XposedHelpers.findClass(
             "com.heytap.cloud.server.config.module.url.WebUrlConstants\$UrlType", cl
         )
@@ -233,10 +276,9 @@ object AutoNav {
         return XposedHelpers.callMethod(instance, "q", welfare) as? String
     }
 
-    /** yl.d.f41385g.r(activity, url) */
+    /** yl.d.g.r(activity, url) */
     private fun openUrl(cl: ClassLoader, activity: Activity, url: String): Boolean {
-        val ylD = XposedHelpers.findClass("yl.d", cl)
-        val manager = XposedHelpers.getStaticObjectField(ylD, "f41385g")
+        val manager = staticInstance(cl, "yl.d", "g", "f41385g")
         XposedHelpers.callMethod(manager, "r", activity, url)
         return true
     }
@@ -516,12 +558,13 @@ object Injector {
                     // JS 返回 "{\"bridge\":\"object\"}" 时，raw 实际内容是
                     // "\"{\\\"bridge\\\":\\\"object\\\"}\""，
                     // 因此必须匹配带反斜杠的转义形式。
+                    // 用 result（raw ?: "null"）计算，避免 raw 为 null 时先触发 NPE。
                     val hasBridge =
-                        raw.contains("\\\"bridge\\\":\\\"object\\\"") ||
-                        raw.contains("\\\"bridge\\\": \\\"object\\\"") ||
-                        raw.contains("\"bridge\":\"object\"") ||
-                        raw.contains("\"bridge\": \"object\"")
-                    if (raw == null || raw == "null" || !hasBridge) {
+                        result.contains("\\\"bridge\\\":\\\"object\\\"") ||
+                        result.contains("\\\"bridge\\\": \\\"object\\\"") ||
+                        result.contains("\"bridge\":\"object\"") ||
+                        result.contains("\"bridge\": \"object\"")
+                    if (raw == null || result == "null" || !hasBridge) {
                         if (attempt + 1 < MAX_PROBE_ATTEMPTS) {
                             XposedBridge.log(
                                 "[AutoCloud][JSProbe] bridge not ready; retry " +

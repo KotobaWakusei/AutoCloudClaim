@@ -76,8 +76,21 @@ object Script {
   }
 
   function cardOf(el) {
-    return el.closest('.task-card') || el.closest('[class*="task-card"]') ||
-           el.closest('li') || document.body;
+    // 真机（11.3.5）结构：单卡是 div.vui-card，容器是 div.task-card-list。
+    // 不能用 [class*="task-card"] 泛匹配——它会先命中列表容器，
+    // 导致整页文本被当成一张卡片：任意一张卡出现「注册」会 SKIP 掉全部任务，
+    // 且 sigOf 冷却 key 退化为整页，所有任务共享一个冷却。
+    var c = el.closest('.task-card') || el.closest('.vui-card') || el.closest('li');
+    if (c) return c;
+    var n = el.parentElement;
+    for (var i = 0; n && i < 6; i++) {
+      if (!/task-card-list/.test(String(n.className || ''))) {
+        var t = txt(n);
+        if (t.length >= 8 && t.length <= 400) return n;
+      }
+      n = n.parentElement;
+    }
+    return document.body;
   }
 
   // 卡片指纹：数字归一化，避免「剩余 120 秒 / 118 秒」这类变化让 key 抖动。

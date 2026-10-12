@@ -20,3 +20,6 @@ captures/
 # 其他
 .DS_Store
 *.log
+
+# generated test artifact
+test/script.body.js
