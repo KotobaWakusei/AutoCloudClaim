@@ -170,6 +170,19 @@ tools/dev.sh stop       # 停止
 脚本只依赖 `adb`；构建时优先用 `/home/kali/.ac-toolchain` 里的 JDK 17 + Gradle 8.14.5
 （可用 `JAVA_HOME` / `GRADLE` / `SERIAL` 覆盖）。
 
+### 启用模块（无 LSPosed 管理器 GUI 时）
+
+LSPosed 的「启用状态 + 作用域」存在 `/data/adb/lspd/config/modules_config.db`，
+没有管理器 GUI 时可以直接改库：
+
+```bash
+tools/enable-module.sh          # 启用模块 + 给 com.heytap.cloud 作用域 + 重启手机
+tools/enable-module.sh --no-reboot
+```
+
+流程：停守护进程 → 导出库 → 写入 `modules` / `modules_state`(enabled=1) / `scope` →
+写回（清掉 WAL）→ **重启手机**（LSPosed 的 hook 在 zygote 启动时注入，改库无法热生效）。
+
 ## 参数（GUI 滑杆/开关 与 adb extra 一一对应）
 
 | Intent extra | GUI | 类型 | 默认 | 含义 |
