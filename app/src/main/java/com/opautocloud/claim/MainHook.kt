@@ -38,6 +38,7 @@ object State {
     const val ACT_START = "com.opautocloud.claim.START"
     const val ACT_STOP = "com.opautocloud.claim.STOP"
     const val ACT_STATUS = "com.opautocloud.claim.STATUS"
+    const val ACT_DIAG = "com.opautocloud.claim.DIAG"
     const val CONTROL_PERMISSION = "com.opautocloud.claim.permission.CONTROL"
 
     @Volatile var sessionToken = ""
@@ -80,6 +81,9 @@ object State {
 
     val main = Handler(Looper.getMainLooper())
     val injected: MutableSet<WebView> = Collections.newSetFromMap(WeakHashMap())
+
+    /** 宿主 Application（模块跑在宿主进程里）：读宿主 APK、拿 applicationInfo 用。 */
+    @Volatile var hostApp: Application? = null
 
     /**
      * 多 WebView 领导选举：福利中心 H5 会在多个 WebView/Activity 里同时加载 profit 页，
@@ -160,6 +164,108 @@ object State {
  */
 object AutoNav {
     private const val MAX_ATTEMPTS = 12
+
+    /**
+     * 宿主 API 的按签名发现。
+     *
+     * 宿主的混淆名每版都变（11.3.5 的 `wo.c` / `yl.d` 在 11.4.5 里已完全消失），
+     * 硬编码等于每个版本都要改一次代码。这里改成**按方法签名找**：
+     *  - 福利中心 URL 构造函数：接收 `WebUrlConstants$UrlType` 枚举、返回 String；
+     *  - 打开网页的方法：接收 (Activity, String)。
+     *
+     * 这些特征跨版本稳定。扫描宿主自己的 APK（模块跑在宿主进程里，读得到），
+     * 结果缓存进模块自己的 SharedPreferences，每个版本只扫一次。
+     */
+    object HostApi {
+        private const val URL_TYPE_CLASS =
+            "com.heytap.cloud.server.config.module.url.WebUrlConstants\$UrlType"
+        private const val URL_TYPE_CONST = "WELFARE_CENTER"
+
+        private var urlBuilderCache: DexScan.MethodRef? = null
+        private var launcherCache: DexScan.MethodRef? = null
+        private var scanned = false
+
+        private fun apkPath(): String? = State.hostApp?.applicationInfo?.sourceDir
+
+        /** 扫一次宿主 APK，找出关键方法并缓存。 */
+        private fun ensureScanned(cl: ClassLoader) {
+            if (scanned) return
+            scanned = true
+            val apk = DexScan.hostApkPath(apkPath()) ?: run {
+                XposedBridge.log("[AutoNav] host apk path unavailable, signature discovery skipped")
+                return
+            }
+            runCatching {
+                urlBuilderCache = DexScan.findMethods(apk) { params, ret ->
+                    ret == "java.lang.String" && params.size == 1 &&
+                        params[0].endsWith("WebUrlConstants\$UrlType")
+                }.firstOrNull { it.isStatic }
+                    ?: DexScan.findMethods(apk) { params, ret ->
+                        ret == "java.lang.String" && params.size == 1 &&
+                            params[0].endsWith("WebUrlConstants\$UrlType")
+                    }.firstOrNull()
+
+                launcherCache = DexScan.findMethods(apk) { params, ret ->
+                    params.size == 2 && params[0] == "android.app.Activity" &&
+                        params[1] == "java.lang.String"
+                }.firstOrNull { it.isStatic }
+
+                XposedBridge.log(
+                    "[AutoNav] signature discovery: urlBuilder=" +
+                        (urlBuilderCache?.let { "${it.className}#${it.methodName}" } ?: "none") +
+                        " launcher=" +
+                        (launcherCache?.let { "${it.className}#${it.methodName}" } ?: "none")
+                )
+            }.onFailure {
+                XposedBridge.log("[AutoNav] signature discovery failed: " + it)
+            }
+        }
+
+        /** 单例实例：找静态字段里类型等于自身（或任意静态字段）的实例。 */
+        private fun singletonOf(clazz: Class<*>): Any? {
+            var fallback: Any? = null
+            for (f in clazz.declaredFields) {
+                if (!java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
+                if (f.type.isPrimitive) continue
+                val v = runCatching {
+                    f.isAccessible = true
+                    f.get(null)
+                }.getOrNull() ?: continue
+                if (f.type == clazz) return v
+                if (fallback == null) fallback = v
+            }
+            return fallback
+        }
+
+        /** 用发现的 URL 构造函数拼福利中心地址。 */
+        fun buildUrl(cl: ClassLoader): String? {
+            ensureScanned(cl)
+            val ref = urlBuilderCache ?: return null
+            return runCatching {
+                val urlType = XposedHelpers.findClass(URL_TYPE_CLASS, cl)
+                val welfare = XposedHelpers.getStaticObjectField(urlType, URL_TYPE_CONST)
+                val clazz = XposedHelpers.findClass(ref.className, cl)
+                val url = if (ref.isStatic) {
+                    XposedHelpers.callStaticMethod(clazz, ref.methodName, welfare)
+                } else {
+                    val inst = singletonOf(clazz) ?: return null
+                    XposedHelpers.callMethod(inst, ref.methodName, welfare)
+                } as? String
+                url?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        }
+
+        /** 用发现的 (Activity, String) 方法打开网页。 */
+        fun openUrl(cl: ClassLoader, activity: Activity, url: String): Boolean {
+            ensureScanned(cl)
+            val ref = launcherCache ?: return false
+            return runCatching {
+                val clazz = XposedHelpers.findClass(ref.className, cl)
+                XposedHelpers.callStaticMethod(clazz, ref.methodName, activity, url)
+                true
+            }.getOrDefault(false)
+        }
+    }
 
     /**
      * 版本无关的导航兜底。
@@ -405,10 +511,15 @@ object AutoNav {
         }.onFailure {
             XposedBridge.log("[AutoNav] server url lookup failed: " + it)
         }
-        return runCatching { localWelfareUrl(cl) }.getOrElse {
-            XposedBridge.log("[AutoNav] local url lookup failed: " + it)
-            null
+        // 硬编码兜底：11.3.5 的 wo.c.f.q(UrlType)
+        runCatching { localWelfareUrl(cl) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
+        // 通用发现：按签名找 (UrlType) -> String 的方法，跨版本稳定
+        runCatching { HostApi.buildUrl(cl) }.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+            XposedBridge.log("[AutoNav] welfare url from signature discovery: " + it)
+            return it
         }
+        XposedBridge.log("[AutoNav] local url lookup failed")
+        return null
     }
 
     /** wo.c.f.q(WebUrlConstants$UrlType.WELFARE_CENTER) */
@@ -423,9 +534,18 @@ object AutoNav {
 
     /** yl.d.g.r(activity, url) */
     private fun openUrl(cl: ClassLoader, activity: Activity, url: String): Boolean {
-        val manager = staticInstance(cl, "yl.d", "g", "f41385g")
-        XposedHelpers.callMethod(manager, "r", activity, url)
-        return true
+        // 硬编码候选（11.3.5）
+        runCatching {
+            val manager = staticInstance(cl, "yl.d", "g", "f41385g")
+            XposedHelpers.callMethod(manager, "r", activity, url)
+            return true
+        }.onFailure {
+            XposedBridge.log("[AutoNav] hardcoded open failed: " + it)
+        }
+        // 通用发现：按签名找 (Activity, String) -> void 的方法
+        val ok = runCatching { HostApi.openUrl(cl, activity, url) }.getOrDefault(false)
+        if (ok) XposedBridge.log("[AutoNav] opened via signature discovery")
+        return ok
     }
 }
 
@@ -443,6 +563,7 @@ class MainHook : IXposedHookLoadPackage {
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val app = param.thisObject as Application
+                    State.hostApp = app
                     Trigger.register(app)
                     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
                         override fun onActivityResumed(activity: Activity) {
@@ -959,6 +1080,7 @@ object Trigger {
     // 整体不会被标记为已注册，下次 attach 会把第一个注册两次，START 就被执行两遍。
     private var controlRegistered = false
     private var shellRegistered = false
+    private var diagRegistered = false
 
     fun register(app: Application) {
         fun filter() = IntentFilter().apply {
@@ -993,7 +1115,20 @@ object Trigger {
                 XposedBridge.log("[AutoCloud] shell receiver registration failed: " + it)
             }
         }
-    }
+        // 诊断广播只在 shell 接收器上（要 DUMP 权限），GUI 侧不暴露
+        if (!diagRegistered) {
+            runCatching {
+                val f = IntentFilter().apply { addAction(State.ACT_DIAG) }
+                registerProtectedReceiver(
+                    app, ShellReceiver, f, android.Manifest.permission.DUMP, sdk
+                )
+            }.onSuccess {
+                diagRegistered = true
+                XposedBridge.log("[AutoCloud] diag receiver registered")
+            }.onFailure {
+                XposedBridge.log("[AutoCloud] diag receiver registration failed: " + it)
+            }
+        }    }
 
     private fun registerProtectedReceiver(
         app: Application,
@@ -1078,6 +1213,57 @@ object Trigger {
                 State.publish(ctx, phase = "已停止", line = "收到 STOP")
                 State.sessionToken = ""
             }
+            State.ACT_DIAG -> {
+                // 诊断：宿主每版重新混淆，方法名/类名会变。
+                // 这里在**宿主进程内**扫描宿主自己的 APK（进程内读自己的包无需权限），
+                // 把「按签名还能定位到哪些方法」打出来——不用反编译、不用猜。
+                if (!allowShellSession) return
+                runCatching { runDiag(ctx, intent) }.onFailure {
+                    XposedBridge.log("[AutoCloud] DIAG failed: " + it)
+                }
+            }
+        }
+    }
+
+    /** DIAG：扫描宿主 APK，输出关键方法定位结果。 */
+    private fun runDiag(ctx: Context, intent: Intent) {
+        val apk = ctx.applicationInfo.sourceDir
+        val findClass = intent.getStringExtra("find")
+        val findStr = intent.getStringExtra("str")
+        XposedBridge.log("[AutoCloud] DIAG scan $apk")
+
+        if (!findClass.isNullOrBlank()) {
+            val classes = DexScan.findClasses(apk, findClass)
+            XposedBridge.log("[AutoCloud] DIAG classes~'$findClass' = ${classes.size}")
+            classes.take(40).forEach { XposedBridge.log("[AutoCloud] DIAG   class $it") }
+        }
+        if (!findStr.isNullOrBlank()) {
+            val methods = DexScan.findMethodsReferencingString(apk, findStr)
+            XposedBridge.log("[AutoCloud] DIAG methods referencing '$findStr' = ${methods.size}")
+            methods.take(40).forEach {
+                XposedBridge.log(
+                    "[AutoCloud] DIAG   ${it.className}#${it.methodName}" +
+                        "(${it.params.joinToString(",")}) : ${it.ret}"
+                )
+            }
+        }
+        val builders = DexScan.findMethods(apk) { params, ret ->
+            ret == "java.lang.String" && params.size == 1 &&
+                params[0].endsWith("WebUrlConstants\$UrlType")
+        }
+        XposedBridge.log("[AutoCloud] DIAG url builders (UrlType->String) = ${builders.size}")
+        builders.take(20).forEach {
+            XposedBridge.log("[AutoCloud] DIAG   ${it.className}#${it.methodName} static=${it.isStatic}")
+        }
+        val launchers = DexScan.findMethods(apk) { params, _ ->
+            params.size == 2 && params[0] == "android.app.Activity" &&
+                params[1] == "java.lang.String"
+        }
+        XposedBridge.log("[AutoCloud] DIAG openers (Activity,String) = ${launchers.size}")
+        launchers.take(30).forEach {
+            XposedBridge.log(
+                "[AutoCloud] DIAG   ${it.className}#${it.methodName} static=${it.isStatic} : ${it.ret}"
+            )
         }
     }
 }
