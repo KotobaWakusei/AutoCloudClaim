@@ -181,8 +181,12 @@ object AutoNav {
             "com.heytap.cloud.server.config.module.url.WebUrlConstants\$UrlType"
         private const val URL_TYPE_CONST = "WELFARE_CENTER"
 
+        /** 服务端运营位配置里「福利中心入口」的 key（服务端约定的常量，跨版本稳定）。 */
+        private const val CONFIG_KEY = "keHuDuanFuLiZhongXinRuKouText"
+
         private var urlBuilderCache: DexScan.MethodRef? = null
         private var launcherCache: DexScan.MethodRef? = null
+        private var configMapCache: DexScan.MethodRef? = null
         private var scanned = false
 
         private fun apkPath(): String? = State.hostApp?.applicationInfo?.sourceDir
@@ -210,11 +214,17 @@ object AutoNav {
                         params[1] == "java.lang.String"
                 }.firstOrNull { it.isStatic }
 
+                // 运营位配置：反查引用了配置 key 的方法（返回 Map 的那个）
+                configMapCache = DexScan.findMethodsReferencingString(apk, CONFIG_KEY)
+                    .firstOrNull { it.ret == "java.util.Map" }
+
                 XposedBridge.log(
                     "[AutoNav] signature discovery: urlBuilder=" +
                         (urlBuilderCache?.let { "${it.className}#${it.methodName}" } ?: "none") +
                         " launcher=" +
-                        (launcherCache?.let { "${it.className}#${it.methodName}" } ?: "none")
+                        (launcherCache?.let { "${it.className}#${it.methodName}" } ?: "none") +
+                        " configMap=" +
+                        (configMapCache?.let { "${it.className}#${it.methodName}" } ?: "none")
                 )
             }.onFailure {
                 XposedBridge.log("[AutoNav] signature discovery failed: " + it)
@@ -253,6 +263,33 @@ object AutoNav {
                 } as? String
                 url?.takeIf { it.isNotBlank() }
             }.getOrNull()
+        }
+
+        /**
+         * 从服务端运营位配置里取福利中心入口 URL。
+         *
+         * 这是 11.3.5 真机验证过「真正能出地址」的那条路：本地兜底构造器依赖
+         * cloudconfig 的域名，未加载时恒为空。配置 key 是服务端约定的常量，
+         * 跨版本稳定，所以按「谁引用了这个 key」反查它的读取方。
+         */
+        fun configUrl(cl: ClassLoader): String? {
+            ensureScanned(cl)
+            val ref = configMapCache ?: return null
+            return runCatching {
+                val clazz = XposedHelpers.findClass(ref.className, cl)
+                val target = if (ref.isStatic) clazz else (singletonOf(clazz) ?: return null)
+                // 形参：一个 String（运营位类型）时传 "10"，无参时不传
+                val map = when {
+                    ref.params.isEmpty() ->
+                        XposedHelpers.callMethod(target, ref.methodName)
+                    ref.params.size == 1 && ref.params[0] == "java.lang.String" ->
+                        XposedHelpers.callMethod(target, ref.methodName, "10")
+                    else -> return null
+                } as? Map<*, *> ?: return null
+                val star = map[CONFIG_KEY] ?: return null
+                val showData = XposedHelpers.callMethod(star, "getShowData")
+                XposedHelpers.callMethod(showData, "getUrl") as? String
+            }.getOrNull()?.takeIf { it.isNotBlank() }
         }
 
         /** 用发现的 (Activity, String) 方法打开网页。 */
@@ -513,12 +550,17 @@ object AutoNav {
         }
         // 硬编码兜底：11.3.5 的 wo.c.f.q(UrlType)
         runCatching { localWelfareUrl(cl) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
-        // 通用发现：按签名找 (UrlType) -> String 的方法，跨版本稳定
+        // 通用发现 ①：服务端运营位配置里的入口 URL（真机验证过真正能出地址的路）
+        runCatching { HostApi.configUrl(cl) }.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+            XposedBridge.log("[AutoNav] welfare url from config discovery: " + it)
+            return it
+        }
+        // 通用发现 ②：按签名找 (UrlType) -> String 的方法，跨版本稳定
         runCatching { HostApi.buildUrl(cl) }.getOrNull()?.takeIf { it.isNotBlank() }?.let {
             XposedBridge.log("[AutoNav] welfare url from signature discovery: " + it)
             return it
         }
-        XposedBridge.log("[AutoNav] local url lookup failed")
+        XposedBridge.log("[AutoCloud] local url lookup failed")
         return null
     }
 
@@ -731,64 +773,122 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * 按「参数形状」挂 hook，不写死方法签名。
+     *
+     * 11.4.5 实测：openAppAndStartTracking 的参数类型变了
+     * （第三个混淆类型 `eb0.a` 换了），写死签名必然 NoSuchMethodError。
+     * 方法名和参数*形状*（Activity + String + int + ...）跨版本稳定，
+     * 这里反射取真实参数类型再挂，并对内嵌类一起处理。
+     */
+    private fun hookByShape(
+        className: String,
+        classLoader: ClassLoader,
+        methodName: String?,
+        matches: (List<Class<*>>) -> Boolean,
+        hook: XC_MethodHook,
+    ): Int {
+        val clazz = XposedHelpers.findClass(className, classLoader)
+        var hooked = 0
+        val all = listOf(clazz) + clazz.declaredClasses.toList()
+        for (c in all) {
+            for (m in c.declaredMethods) {
+                if (methodName != null && m.name != methodName) continue
+                val params = m.parameterTypes.toList()
+                if (!matches(params)) continue
+                val args = ArrayList<Any>(params.size + 1)
+                args.addAll(params)
+                args.add(hook)
+                runCatching {
+                    XposedHelpers.findAndHookMethod(c, m.name, *args.toTypedArray())
+                    hooked++
+                    XposedBridge.log(
+                        "[AutoCloud] hooked " + c.simpleName + "#" + m.name +
+                            "(" + params.joinToString(",") { it.simpleName } + ")"
+                    )
+                }.onFailure {
+                    XposedBridge.log("[AutoCloud] hook failed on ${c.name}#${m.name}: $it")
+                }
+            }
+        }
+        return hooked
+    }
+
     private fun installTaskWallTrackingHooks(classLoader: ClassLoader) {
+        // 1) 开始计时：Activity + 若干 String/int，参数位置可能变，按内容认
+        val startHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                // 包名：第一个像包名的 String（含点）；时长：第一个数字参数
+                var pkg = ""
+                var sec = -1
+                param.args.forEachIndexed { i, a ->
+                    if (a is String && pkg.isEmpty() && a.contains('.') && !a.contains(' ')) {
+                        pkg = a
+                    }
+                    if (a is Int && sec < 0) sec = a
+                    if (a is Long && sec < 0) sec = a.toInt()
+                }
+                State.sdkTrackPackage = pkg
+                State.sdkTrackRequiredSec = sec
+                // Clear the previous task's result before starting a new timing session.
+                // Otherwise the JS bridge could mistake stale duration/timeLeft values
+                // for a fresh completion when only the start callback has fired.
+                State.sdkTrackDurationSec = -1L
+                State.sdkTrackTimeLeftSec = -1L
+                State.sdkTrackVersion = System.nanoTime()
+                XposedBridge.log(
+                    "[AutoCloud] SDK tracking package=" + State.sdkTrackPackage +
+                        " required=" + State.sdkTrackRequiredSec + "s"
+                )
+            }
+        }
         runCatching {
-            XposedHelpers.findAndHookMethod(
+            val n = hookByShape(
                 "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute",
                 classLoader,
                 "openAppAndStartTracking",
-                android.app.Activity::class.java,
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                "eb0.a",
-                String::class.java,
-                String::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        State.sdkTrackPackage = param.args[1] as? String ?: ""
-                        State.sdkTrackRequiredSec = (param.args[2] as? Int) ?: -1
-                        // Clear the previous task's result before starting a new timing session.
-                        // Otherwise the JS bridge could mistake stale duration/timeLeft values
-                        // for a fresh completion when only the start callback has fired.
-                        State.sdkTrackDurationSec = -1L
-                        State.sdkTrackTimeLeftSec = -1L
-                        State.sdkTrackVersion = System.nanoTime()
-                        XposedBridge.log(
-                            "[AutoCloud] SDK tracking package=" + State.sdkTrackPackage +
-                                " required=" + State.sdkTrackRequiredSec + "s"
-                        )
-                    }
+                { params ->
+                    params.isNotEmpty() &&
+                        params.any { it == android.app.Activity::class.java } &&
+                        params.any { it == String::class.java } &&
+                        params.any { it == Int::class.javaPrimitiveType || it == Int::class.java }
                 },
+                startHook,
             )
+            if (n == 0) XposedBridge.log("[AutoCloud] SDK openAppCountTime shape not found")
         }.onFailure {
             XposedBridge.log("[AutoCloud] SDK openAppCountTime hook unavailable: " + it)
         }
 
+        // 2) 计时结果：单参 JSONObject 的方法（外层类或其内嵌类）
+        val resultHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val result = param.args.firstOrNull { it is org.json.JSONObject } as? org.json.JSONObject
+                    ?: return
+                val packageName = result.optString("packageName")
+                val duration = result.optLong("duration", -1L)
+                val timeLeft = result.optLong("timeLeft", -1L)
+
+                State.sdkTrackPackage = packageName
+                State.sdkTrackDurationSec = duration
+                State.sdkTrackTimeLeftSec = timeLeft
+                State.sdkTrackVersion = System.nanoTime()
+
+                XposedBridge.log(
+                    "[AutoCloud] SDK tracking result package=" + packageName +
+                        " duration=" + duration + "s timeLeft=" + timeLeft + "s"
+                )
+            }
+        }
         runCatching {
-            XposedHelpers.findAndHookMethod(
-                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute" + "$" + "a",
+            val n = hookByShape(
+                "com.oplus.pay.opensdk.taskwall.jsapi.PayOpenAppCountTimeExecute",
                 classLoader,
-                "a",
-                org.json.JSONObject::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val result = param.args[0] as? org.json.JSONObject ?: return
-                        val packageName = result.optString("packageName")
-                        val duration = result.optLong("duration", -1L)
-                        val timeLeft = result.optLong("timeLeft", -1L)
-
-                        State.sdkTrackPackage = packageName
-                        State.sdkTrackDurationSec = duration
-                        State.sdkTrackTimeLeftSec = timeLeft
-                        State.sdkTrackVersion = System.nanoTime()
-
-                        XposedBridge.log(
-                            "[AutoCloud] SDK tracking result package=" + packageName +
-                                " duration=" + duration + "s timeLeft=" + timeLeft + "s"
-                        )
-                    }
-                },
+                null,
+                { params -> params.size == 1 && params[0] == org.json.JSONObject::class.java },
+                resultHook,
             )
+            if (n == 0) XposedBridge.log("[AutoCloud] SDK tracking result shape not found")
         }.onFailure {
             XposedBridge.log("[AutoCloud] SDK tracking result hook unavailable: " + it)
         }
