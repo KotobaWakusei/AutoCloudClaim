@@ -394,6 +394,67 @@ function nextDayUninstallPage(bridge, state) {
   return { all: [fragWrap, fragEl, list, card, inst, claim], extra: { inst, claim } };
 }
 
+// T11/T12: 任务种类识别与路由
+// 各种类型的任务卡一次出现：安装 / 浏览 / 签到 / 分享 / 答题 / 注册 / 次留
+function mixedKindsPage(bridge, state) {
+  const fragEl = new El('span', '0', { id: 'fragment-num', className: 'fragment-num' });
+  const fragWrap = new El('div', '', { className: 'coin-bar', children: [fragEl] });
+
+  const mk = (text, btnText, tag) => {
+    const card = new El('div', text, { className: 'task-card' });
+    const btn = new El(tag || 'button', btnText, {
+      clickHook: () => { fragEl.innerText = String(Number(fragEl._text || '0') + 5); },
+    });
+    card.appendChild(btn);
+    return { card, btn };
+  };
+
+  const inst = mk('下载安装 快手 领20积分', '开始安装', 'span');
+  const brow = mk('浏览快手15秒 领碎片', '立即打开');
+  const sign = mk('每日签到 领5积分', '去签到');
+  const shr = mk('分享给好友 助力领积分', '去分享');
+  const quiz = mk('答题赢积分 参与挑战', '去答题');
+  const reg = mk('注册云账号 领大额奖励', '去完成');
+  const nxt = mk('连续签到7天 第2天再来', '去签到');
+
+  const list = new El('div', '', {
+    className: 'task-card-list',
+    children: [inst.card, brow.card, sign.card, shr.card, quiz.card, reg.card, nxt.card],
+  });
+  const all = [fragWrap, fragEl, list,
+    inst.card, inst.btn, brow.card, brow.btn, sign.card, sign.btn,
+    shr.card, shr.btn, quiz.card, quiz.btn, reg.card, reg.btn, nxt.card, nxt.btn];
+  return { all, extra: { inst, brow, sign, shr, quiz, reg, nxt } };
+}
+
+// T12: 只放「去 XX」型卡片，隔离浏览/安装卡，确保走到 GO 分支
+function goKindsPage(bridge, state) {
+  const fragEl = new El('span', '0', { id: 'fragment-num', className: 'fragment-num' });
+  const fragWrap = new El('div', '', { className: 'coin-bar', children: [fragEl] });
+
+  const mk = (text, btnText) => {
+    const card = new El('div', text, { className: 'task-card' });
+    const btn = new El('button', btnText, {
+      clickHook: () => { fragEl.innerText = String(Number(fragEl._text || '0') + 5); },
+    });
+    card.appendChild(btn);
+    return { card, btn };
+  };
+
+  const sign = mk('每日签到 领5积分', '去签到');
+  const shr = mk('分享给好友 助力领积分', '去分享');
+  const quiz = mk('答题赢积分 参与挑战', '去答题');
+  const reg = mk('注册云账号 领大额奖励', '去完成');
+
+  const list = new El('div', '', {
+    className: 'task-card-list',
+    children: [sign.card, shr.card, quiz.card, reg.card],
+  });
+  const all = [fragWrap, fragEl, list,
+    sign.card, sign.btn, shr.card, shr.btn, quiz.card, quiz.btn, reg.card, reg.btn];
+  return { all, extra: { sign, shr, quiz, reg } };
+}
+
 async function main() {
   console.log('=== script.test.js ===\n');
   const body = extractScriptBody();
@@ -552,6 +613,52 @@ async function main() {
       r.log.filter(l => l.includes('uninstall') || l.includes('claim ok')).join(' | '));
     check('never uninstalled', !has(r.log, 'bridge.uninstall'),
       r.log.filter(l => l.includes('uninstall')).join(' | '));
+  }
+
+  // T11: 任务种类识别 — dry run 的 DUMP 要把每张卡的种类点出来
+  console.log('\nT11 task kind inventory (dry run):');
+  {
+    const r = await runScenario('kinds-dump', mixedKindsPage, {
+      maxTasks: 1,
+      timeoutMs: 15000,
+      dryRun: true,
+      endWhen: (log) => has(log, 'DUMP task kind='),
+    });
+    const kinds = r.log.filter(l => l.includes('DUMP task kind='));
+    const kindOf = (s) => (r.log.find(l => l.includes('DUMP task kind=' + s + ' ')) || '');
+    check('dump lists task cards with kinds', kinds.length >= 5,
+      'cards=' + kinds.length + ' :: ' + kinds.join(' | '));
+    check('install card detected', !!kindOf('install'), kindOf('install'));
+    check('browse card detected', !!kindOf('browse'), kindOf('browse'));
+    check('checkin card detected', !!kindOf('checkin'), kindOf('checkin'));
+    check('share card detected', !!kindOf('share'), kindOf('share'));
+    check('quiz card detected', !!kindOf('quiz'), kindOf('quiz'));
+    check('register card detected', !!kindOf('register'), kindOf('register'));
+    check('nextday card detected', !!kindOf('nextday'), kindOf('nextday'));
+  }
+
+  // T12: 任务种类路由 — 注册类跳过；签到/分享/答题类照点（真实点击）
+  console.log('\nT12 task kind routing:');
+  {
+    const r = await runScenario('kinds-run', goKindsPage, {
+      maxTasks: 1,
+      timeoutMs: 20000,
+      maxSleepMs: 40,          // 压缩停留时长，让三个 GO 卡在测试窗口内跑完
+      endWhen: (log) =>
+        (log.some(l => l.includes('click GO') && l.includes('kind=quiz')) &&
+         log.some(l => l.includes('SKIP manual-registration'))),
+    });
+    check('register card skipped', r.log.some(l => l.includes('SKIP manual-registration')),
+      r.log.filter(l => l.includes('SKIP')).join(' | '));
+    check('checkin card clicked', r.log.some(l => l.includes('click GO') && l.includes('kind=checkin')),
+      r.log.filter(l => l.includes('click ')).join(' | '));
+    check('share card clicked', r.log.some(l => l.includes('click GO') && l.includes('kind=share')),
+      r.log.filter(l => l.includes('click ')).join(' | '));
+    check('quiz card clicked', r.log.some(l => l.includes('click GO') && l.includes('kind=quiz')),
+      r.log.filter(l => l.includes('click ')).join(' | '));
+    check('no click on registration card',
+      !r.log.some(l => l.includes('click ') && l.includes('kind=register')),
+      r.log.filter(l => l.includes('click ')).join(' | '));
   }
 
   console.log('\nresult: ' + pass + ' passed, ' + fail + ' failed');

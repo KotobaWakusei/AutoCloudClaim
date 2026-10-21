@@ -41,10 +41,12 @@ object Script {
 
   // 黑名单：花钱的、关闭类的、以及无法被真实验证的（注册类一律留给人工）
   var BLACK = /兑换|支付|购买|抢购|开通|续费|升级|套餐|优惠|金币|提现|关闭|收起|我已注册|确认完成|立即注册/;
-  var CLAIM = /^(立即领取|领取|继续领取|去领取|领奖)$/;
-  var INSTALL = /^(下载安装|开始安装|安装|立即下载|下载|继续安装|重新安装|点击继续安装应用领奖励)$/;
-  var OPEN = /^(立即打开|打开|继续打开|开始体验|去体验|立即体验)$/;
-  var GO = /^(去完成|去下载|去安装|去打开|去浏览|去做任务)$/;
+  var CLAIM = /^(立即领取|领取|继续领取|去领取|领奖|领取奖励|立即领奖)$/;
+  var INSTALL = /^(下载安装|开始安装|安装|立即下载|下载|继续安装|重新安装|点击继续安装应用领奖励|安装应用|立即安装)$/;
+  var OPEN = /^(立即打开|打开|继续打开|开始体验|去体验|立即体验|打开应用|立即去玩)$/;
+  // 通用「去 XX」动作：签到/分享/答题/搜索/关注等任务类型的按钮文案不固定，
+  // 但都以「去 + 动作」为主。点它就是用户真实点击，H5 自己会推进状态。
+  var GO = /^(去完成|去下载|去安装|去打开|去浏览|去做任务|去体验|去玩|去签到|去打卡|去分享|去转发|去助力|去邀请|去答题|去搜索|去关注|去观看|去阅读|去试用|去参与|去解锁|去领取任务|去完成任务)$/;
   var BUSY = /安装中|等待中|下载中|加载中|审核中|刷新中|次留|次日/;
 
   function pool() { return document.querySelectorAll('button,[role="button"],a,div,span'); }
@@ -53,7 +55,9 @@ object Script {
   // inCard=true：只认任务卡片里的按钮。profit 页顶部有任务切换 pill（也写着
   // 「打开/安装中」），点了会把任务墙切到别的任务（ZTID 变化，2026-10-14 真机
   // 复现），必须把这类元素排除在动作候选之外。
-  function findBtn(re, inCard) {
+  // kind：动作类型（CLAIM/OPEN/INSTALL/GO）。处于冷却中的候选会被跳过——
+  // 否则每次扫描都挑同一个按钮，脚本就在一张卡上空转，看门狗到期才收工。
+  function findBtn(re, inCard, kind) {
     var all = pool(), best = null, bestScore = -1e9;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
@@ -66,6 +70,7 @@ object Script {
       if (el.className && /(^|[ _-])disabled([ _-]|$)/i.test(String(el.className))) continue;
       var r = el.getBoundingClientRect(), area = r.width * r.height;
       if (area < 40) continue;
+      if (kind && onCool(kind + '|' + sigOf(el))) continue;
 
       var tag = String(el.tagName || '').toLowerCase();
       var role = String(el.getAttribute('role') || '').toLowerCase();
@@ -108,6 +113,41 @@ object Script {
     return src.replace(/\d+/g, '#').slice(0, 64);
   }
 
+  // ---------- 任务种类识别 ----------
+  // 福利中心的任务卡不是一种：下载安装、浏览停留、签到、分享、答题、关注、次留……
+  // 每一类的「能自动完成吗 / 完成后能不能卸载 / 要不要等」都不一样。
+  // 这里只做分类和路由判断，不改变「只点页面上的真按钮」这条边界。
+  var KINDS = [
+    // 必须最先判：注册类永远做不了（真实验证不了），次留类今天做不完
+    ['register', /注册|开户|实名|激活账号|办理会员/],
+    // 「连续签到7天 / 累计签到3天」是跨天任务；「每日签到」是当天任务，归 checkin
+    ['nextday',  /次留|次日|隔日|明天|后天|第2天|第二天|连续签到|连续\d+天|累计签到|累计\d+天/],
+    ['install',  /下载安装|立即下载|安装应用|去安装|装应用|应用下载/],
+    ['browse',   /浏览|停留|体验|观看|阅读|试用|使用\d*秒/],
+    ['checkin',  /签到|打卡/],
+    ['share',    /分享|转发|邀请|拉人|助力/],
+    ['search',   /搜索|搜一搜/],
+    ['quiz',     /答题|问答|挑战|测试题/],
+    ['follow',   /关注|加好友|加群/],
+    ['video',    /看视频|短视频|小视频/],
+    ['order',    /下单|购买|充值|续费|开通/]   // 花钱类：即使漏网也绝不能自动做
+  ];
+
+  function kindOf(cardText) {
+    var t = String(cardText || '');
+    for (var i = 0; i < KINDS.length; i++) {
+      if (KINDS[i][1].test(t)) return KINDS[i][0];
+    }
+    return 'unknown';
+  }
+
+  // 明确做不了 / 不该自动做的种类。
+  // register：需要真实账号与实名信息，脚本伪造不了（硬边界：绝不伪造「我已注册」）。
+  // order：花钱类，黑名单漏网时的兜底。
+  function kindBlocked(kind) {
+    return kind === 'register' || kind === 'order';
+  }
+
   // ---------- 冷却：同一张卡片不允许被无限重点击 ----------
   // 服务端没确认时（风控/状态机未推进），3 秒后再扫到同一个按钮会再次硬点，
   // 表现为反复刷 grant-award 并触发 5610401~5610404。这里用「时间冷却 + 连败上限」挡住。
@@ -124,6 +164,16 @@ object Script {
   }
 
   function markOk(key) { failCnt[key] = 0; cool[key] = 0; }
+
+  // 动作「做完了」但页面还没刷新时，按钮往往还是原样。
+  // markOk 会把冷却清零 → 下一轮立刻又点同一张卡，死循环刷同一个接口
+  // （真机表现：同一个「去签到」被点了几十次，40 分钟看门狗才收工）。
+  // 成功也给一段冷却：先去做别的卡，等页面状态刷新了再回来。
+  var SUCCESS_COOLDOWN_MS = 45_000;
+  function markOkCooldown(key) {
+    failCnt[key] = 0;
+    cool[key] = Date.now() + SUCCESS_COOLDOWN_MS;
+  }
 
   function markFail(key, el, maxFails, cooldownMs) {
     failCnt[key] = (failCnt[key] || 0) + 1;
@@ -249,6 +299,31 @@ object Script {
     }
     log('DUMP action-candidates=' + (cand.length ? cand.join(' | ') : 'none'));
     log('DUMP other-text=' + (other.length ? other.slice(0, 60).join(' | ') : 'none'));
+
+    // 任务种类清单：一次 dry run 就看清页面上到底有哪几类任务、每类点什么。
+    // 这是「不同种类的任务」的现场依据，缺哪一类就在这里补。
+    var cards = {}, order = [];
+    for (var ci = 0; ci < all.length; ci++) {
+      var cel = all[ci];
+      if (!vis(cel)) continue;
+      var cc = cardOf(cel);
+      if (!cc || cc === document.body) continue;
+      var ck = sigOf(cel);
+      if (!cards[ck]) { cards[ck] = { card: cc, btns: [] }; order.push(ck); }
+      var ct = txt(cel);
+      var ctag = String(cel.tagName || '').toLowerCase();
+      var crole = String(cel.getAttribute('role') || '').toLowerCase();
+      if (ct && ct.length <= 12 && (ctag === 'button' || ctag === 'a' || crole === 'button') &&
+          cards[ck].btns.indexOf(ct) < 0) {
+        cards[ck].btns.push(ct);
+      }
+    }
+    for (var oi = 0; oi < order.length; oi++) {
+      var ok2 = order[oi], oe = cards[ok2];
+      var okind = kindOf(txt(oe.card));
+      log('DUMP task kind=' + okind + ' btns=[' + oe.btns.join(',') + ']' +
+          ' text=' + txt(oe.card).slice(0, 60));
+    }
   }
 
   // 领取成功后（服务端已确认）再考虑卸载本次新装的应用。
@@ -415,6 +490,15 @@ object Script {
 
     S.busy = 0;
     var oc = cardOf(open);
+    var okind = kindOf(txt(oc));
+    // 花钱类卡片在黑名单漏网时兜底跳过；注册类不在这拦——
+    // 「先安装再注册」的卡需要真的打开应用并停留，拦掉反而做不成。
+    if (okind === 'order') {
+      log('SKIP order-task: ' + txt(oc).slice(0, 80));
+      open.setAttribute('data-ac-skip', '1');
+      S.idle = 0;
+      return;
+    }
     var sec = dwellOf(oc);
     var trackBefore = B.sdkTrackVersion();
 
@@ -422,7 +506,7 @@ object Script {
     // 可能被厂商（尤其 ColorOS）冻结，若只靠下面的 bringToFront 会永远执行不到。
     try { B.scheduleReturn(sec + 5); } catch (e) {}
 
-    log('click OPEN "' + txt(open) + '" fallbackDwell=' + sec + 's' +
+    log('click OPEN "' + txt(open) + '" kind=' + okind + ' fallbackDwell=' + sec + 's' +
         ' at=' + String(open.tagName).toLowerCase() +
         ',' + Math.round(open.getBoundingClientRect().top));
     st('正在启动任务应用');
@@ -485,7 +569,7 @@ object Script {
     }
 
     if (sdkVerified) {
-      markOk(key);
+      markOkCooldown(key);
     } else if (left > 0) {
       // 已经回到云服务且 SDK 明确报告不足时长，不把任务当成完成。
       // 不额外空等；冷却住这张卡片，下一轮扫描会去处理别的任务。
@@ -495,7 +579,7 @@ object Script {
       // 某些任务不会走 SDK 回调，保留原有页面流程作为兼容 fallback。
       await sleep(1500);
       st('已回到云服务 · 等待任务刷新');
-      markOk(key);
+      markOkCooldown(key);
     }
 
     await sleep(1500);
@@ -508,8 +592,15 @@ object Script {
 
     S.busy = 0;
     var ic = cardOf(inst);
-    if (/注册/.test(txt(ic)) && !/下载/.test(txt(ic))) {
-      log('SKIP manual-registration: ' + txt(ic).slice(0, 80));
+    var ikind = kindOf(txt(ic));
+    // 注册类：真实验证不了（硬边界：绝不伪造「我已注册」）。
+    // 例外沿用原语义：文案里明写「下载」的卡（下载+注册两步走）不整卡跳过，
+    // 「先安装再注册」这类仍按注册类跳过——注册那步脚本代替不了。
+    var isDownload = /下载/.test(txt(ic));
+    var skipCard = (ikind === 'register' && !isDownload) || ikind === 'order';
+    if (skipCard) {
+      log('SKIP ' + (ikind === 'register' ? 'manual-registration' : 'order-task') + ': ' +
+          txt(ic).slice(0, 80));
       inst.setAttribute('data-ac-skip', '1');
       S.idle = 0;
       await sleep(800);
@@ -522,11 +613,12 @@ object Script {
     // 次留/隔日类任务装了也不卸（卸了服务端复核必判未完成）。
     S.instCard = ic;
     S.instSig = sigOf(inst);
-    S.instNextDay = /次留|次日|隔日|明日|明天|.{0,6}天后|第二天|第2天/.test(txt(ic));
+    S.instNextDay = kindOf(txt(ic)) === 'nextday' || /明天|后天/.test(txt(ic));
     // 以安装前包集合为基准做差集；这比 firstInstallTime 可靠，尤其是恢复备份/系统时间异常时。
     S.beforePkgs = B.installedPackages();
     S.lastT = B.now();
-    log('click INSTALL "' + txt(inst) + '" wantPkg=' + (wantPkg || 'unknown') +
+    log('click INSTALL "' + txt(inst) + '" kind=' + ikind +
+        ' wantPkg=' + (wantPkg || 'unknown') +
         ' baselinePkgs=' + String(S.beforePkgs || '').split(',').filter(Boolean).length);
     st('下载安装中');
     click(inst);
@@ -561,7 +653,9 @@ object Script {
           (wantPkg || 'unknown') + ')');
       markFail(key, inst, 2, 30000);
     } else {
-      markOk(key);
+      // 装好了：也冷却一下。按钮通常还是「开始安装」，
+      // 不冷却的话下一轮会立刻再点一次安装（商店重复拉起）。
+      markOkCooldown(key);
       S.newPkgs = installed;
     }
     S.beforePkgs = '';
@@ -575,15 +669,20 @@ object Script {
 
     S.busy = 0;
     var gc = cardOf(go);
-    if (/注册/.test(txt(gc))) {
-      log('SKIP manual-registration task: ' + txt(gc).slice(0, 80));
+    var gkind = kindOf(txt(gc));
+    // 注册类：真实验证不了，只能人工做。
+    // 「先安装再注册」的卡在安装那步已经放行过，到 GO 这步仍然跳过——
+    // 注册那一步脚本代替不了。
+    if (gkind === 'register' || gkind === 'order') {
+      log('SKIP ' + (gkind === 'register' ? 'manual-registration' : 'order-task') + ': ' +
+          txt(gc).slice(0, 80));
       go.setAttribute('data-ac-skip', '1');
       S.idle = 0;
       return;
     }
 
     var gsec = dwellOf(gc);
-    log('click GO "' + txt(go) + '" wait=' + gsec + 's');
+    log('click GO "' + txt(go) + '" kind=' + gkind + ' wait=' + gsec + 's');
     // GO 任务经常把云服务切到后台（外部页面/应用），此时 JS 的定时被冻结，
     // 下面的 sleep 永远走不完，只能等用户手动切回。靠 Kotlin 侧看门狗到点拉回
     // （页内导航时该调用是 no-op，无影响）。
@@ -591,7 +690,8 @@ object Script {
     click(go);
     await sleep(gsec * 1000 + 3000);
     try { B.cancelReturn(); } catch (e) {}
-    markOk(key);
+    // 成功也冷却：页面状态没刷新前不再点这张卡（否则死点同一个接口）
+    markOkCooldown(key);
     S.idle = 0;
   }
 
@@ -638,20 +738,20 @@ object Script {
       if (S.standby) { S.standby = false; log('standby released: became leader'); }
 
       // 1) 优先领取（只有服务端已置为可领取时才会出现这个按钮）
-      var claim = findBtn(CLAIM, true);
+      var claim = findBtn(CLAIM, true, 'CLAIM');
       if (claim) { await doClaim(claim); continue; }
 
       // 2) 打开应用：优先使用 11.3.5 TaskWall SDK 给出的真实 remainingTime，
       //    页面文案只作为 SDK 未介入时的 fallback。
-      var open = findBtn(OPEN, true);
+      var open = findBtn(OPEN, true, 'OPEN');
       if (open) { await doOpen(open); continue; }
 
       // 3) 触发下载/安装（真实下载，由应用商店与服务端归因校验）
-      var inst = findBtn(INSTALL, true);
+      var inst = findBtn(INSTALL, true, 'INSTALL');
       if (inst) { await doInstall(inst); continue; }
 
       // 4) 通用「去完成/去浏览」：页内浏览型任务
-      var go = findBtn(GO, true);
+      var go = findBtn(GO, true, 'GO');
       if (go) { await doGo(go); continue; }
 
       // 5) 处理中（下载中/审核中…）：最多等 4 分钟，仍卡住就收工
