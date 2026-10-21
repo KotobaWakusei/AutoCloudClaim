@@ -119,11 +119,11 @@ class MainActivity : ComponentActivity() {
 fun ControlScreen() {
     val ctx = LocalContext.current
 
-    // 控制参数
-    var maxTasks by remember { mutableIntStateOf(3) }
-    var dwell by remember { mutableIntStateOf(60) }
-    var uninstall by remember { mutableStateOf(false) }
-    var dry by remember { mutableStateOf(false) }
+    // 控制参数（进程重建后保留用户上次的选择）
+    var maxTasks by rememberSaveable { mutableIntStateOf(3) }
+    var dwell by rememberSaveable { mutableIntStateOf(60) }
+    var uninstall by rememberSaveable { mutableStateOf(true) }
+    var dry by rememberSaveable { mutableStateOf(false) }
 
     // 远端状态（由云服务进程回执）
     var running by remember { mutableStateOf(false) }
@@ -200,6 +200,9 @@ fun ControlScreen() {
     // 点击开始后先拉起目标 App，再持续重发 START，解决进程启动期间动态接收器尚未注册的竞态。
     var startTick by remember { mutableIntStateOf(0) }
     var startInProgress by remember { mutableStateOf(false) }
+    // 握手期间点了「停止」：重发循环必须立刻放弃，
+    // 否则剩余的 START 会把刚停掉的会话偷偷重新拉起。
+    var startAborted by remember { mutableStateOf(false) }
     LaunchedEffect(startTick) {
         if (startTick == 0) return@LaunchedEffect
         val token = sessionToken
@@ -217,6 +220,10 @@ fun ControlScreen() {
                 } else {
                     push("✓ 已收到云服务回执：" + latestPhase)
                 }
+                return@LaunchedEffect
+            }
+            if (startAborted) {
+                startInProgress = false
                 return@LaunchedEffect
             }
 
@@ -266,6 +273,7 @@ fun ControlScreen() {
         running = false
         phase = "正在启动云服务"
         startInProgress = true
+        startAborted = false
         // 新一轮开始：清掉上一轮的计数，避免状态卡长期显示旧值
         claimed = 0
         fragments = 0
@@ -289,6 +297,7 @@ fun ControlScreen() {
         // 先本地复位：云服务进程若已被强停就收不到回执，
         // 不复位的话 running 永远为 true，「开始」按钮会被永久锁死。
         // 云端若其实还活着，它下一次 status 回执会把 running 重新置真。
+        startAborted = true
         running = false
         startInProgress = false
         phase = "已停止"
@@ -413,7 +422,7 @@ fun ControlScreen() {
                     15f..300f, 5f) { dwell = it.toInt() }
                 SwitchRow(
                     "领取成功后卸载本次新装的应用",
-                    "需要 root；次留/审核类任务可能因此被判未完成",
+                    "智能判定：仅卸载「领取对应的卡」；次留/隔日任务会自动保留",
                     uninstall,
                 ) { uninstall = it }
                 SwitchRow(

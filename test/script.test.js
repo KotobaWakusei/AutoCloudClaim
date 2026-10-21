@@ -152,6 +152,7 @@ function makeBridge(overrides = {}) {
     autoUninstall: () => !!overrides.autoUninstall,
     dryRun: () => !!overrides.dryRun,
     isRunning: () => state.running,
+    isLeader: () => overrides.isLeader !== false,
     installedPackages: () => Array.from(state.installed).join(','),
     isInstalled: (pkg) => state.installed.has(String(pkg)),
     now: () => Date.now(),
@@ -329,6 +330,70 @@ function vuiPage(bridge, state) {
   return { all, extra: { regCard, normCard, normBtn } };
 }
 
+// T9/T10: 智能卸载 —「领取的卡 = 刚装的卡」才删；次留/隔日任务永远保留
+// 真实页面里「安装」和「领取」不会同时可见：安装完成后领取按钮才出现。
+function smartUninstallPage(bridge, state) {
+  const fragEl = new El('span', '0', { id: 'fragment-num', className: 'fragment-num' });
+  const fragWrap = new El('div', '', { className: 'coin-bar', children: [fragEl] });
+
+  // 卡 B：纯浏览卡，领取按钮一直可见（领取成功后按钮消失）
+  const cardB = new El('div', '乐享浏览赢好礼', { className: 'task-card' });
+  const claimB = new El('button', '领取', {
+    clickHook: () => {
+      fragEl.innerText = '10';
+      claimB._rect = { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 };
+    },
+  });
+  cardB.appendChild(claimB);
+
+  // 卡 A：安装卡。安装按钮点击 → 1.5s 后「装好了」（包出现 + 领取按钮出现）
+  const cardA = new El('div', '下载安装应用 领取碎片', { className: 'task-card' });
+  const claimA = new El('button', '领取', {
+    rect: { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 },
+    clickHook: () => {
+      fragEl.innerText = String(Number(fragEl._text || '0') + 66);
+      claimA._rect = { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 };
+    },
+  });
+  const instA = new El('span', '开始安装', {
+    clickHook: () => {
+      setTimeout(() => {
+        state.installed.add('com.example.t1');
+        claimA._rect = { width: 120, height: 40, top: 100, bottom: 140, left: 0, right: 120 };
+      }, 1500);
+    },
+  });
+  cardA.appendChild(instA);
+  cardA.appendChild(claimA);
+
+  const list = new El('div', '', { className: 'task-card-list', children: [cardA, cardB] });
+  const all = [fragWrap, fragEl, list, cardA, cardB, claimA, instA, claimB];
+  return { all, extra: { claimA, claimB, instA } };
+}
+
+function nextDayUninstallPage(bridge, state) {
+  const fragEl = new El('span', '0', { id: 'fragment-num', className: 'fragment-num' });
+  const fragWrap = new El('div', '', { className: 'coin-bar', children: [fragEl] });
+  const card = new El('div', '下载安装应用 第2天继续领 赢大额奖励', { className: 'task-card' });
+  const claim = new El('button', '领取', {
+    rect: { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 },
+    clickHook: () => {
+      fragEl.innerText = String(Number(fragEl._text || '0') + 30);
+      claim._rect = { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 };
+    },
+  });
+  const inst = new El('button', '下载安装', {
+    clickHook: () => setTimeout(() => {
+      state.installed.add('com.example.t2');
+      claim._rect = { width: 120, height: 40, top: 100, bottom: 140, left: 0, right: 120 };
+    }, 1200),
+  });
+  card.appendChild(inst);
+  card.appendChild(claim);
+  const list = new El('div', '', { className: 'task-card-list', children: [card] });
+  return { all: [fragWrap, fragEl, list, card, inst, claim], extra: { inst, claim } };
+}
+
 async function main() {
   console.log('=== script.test.js ===\n');
   const body = extractScriptBody();
@@ -434,6 +499,59 @@ async function main() {
         }
       }
     }
+  }
+
+  // T8: 领导选举 — 非领导实例只 standby，不点任何按钮（防多 WebView 重复点击）
+  console.log('\nT8 standby when not leader:');
+  {
+    const r = await runScenario('standby', claimPage, {
+      maxTasks: 1,
+      isLeader: false,
+      timeoutMs: 4000,
+    });
+    check('entered standby', has(r.log, 'standby: another profit instance is active'),
+      r.log.slice(0, 6).join(' | '));
+    check('no clicks while standby', !r.log.some(l => l.includes('click ')),
+      r.log.filter(l => l.includes('click')).join(' | '));
+    check('still running (no END)', !has(r.log, 'END claimed='));
+  }
+
+  // T9: 智能卸载 — 跨卡不乱删；只有「领取对应的卡」成功后才卸载该次安装
+  console.log('\nT9 smart uninstall correlation:');
+  {
+    const r = await runScenario('smart-uninstall', smartUninstallPage, {
+      maxTasks: 3,
+      timeoutMs: 40000,
+      autoUninstall: true,
+      endWhen: (log) => log.some(l => l.includes('bridge.uninstall')),
+    });
+    const uninstalls = r.log.filter(l => l.includes('bridge.uninstall'));
+    const installIdx = r.log.findIndex(l => l.includes('installed new package(s)'));
+    const uninstallIdx = r.log.findIndex(l => l.includes('bridge.uninstall'));
+    check('install detected earlier', installIdx >= 0, r.log.join(' | '));
+    check('exactly one uninstall, for the claimed card',
+      uninstalls.length === 1 && uninstalls[0].includes('com.example.t1'), uninstalls.join(' | '));
+    check('no uninstall before install completes', uninstallIdx > installIdx,
+      'installIdx=' + installIdx + ' uninstallIdx=' + uninstallIdx);
+    if (uninstalls.length !== 1) {
+      console.log('  --- T9 log ---');
+      for (const l of r.log) console.log('  | ' + l);
+    }
+  }
+
+  // T10: 次留/隔日任务 — 装了也不卸（服务端次日复核，卸了判未完成）
+  console.log('\nT10 next-day keeps installed:');
+  {
+    const r = await runScenario('next-day', nextDayUninstallPage, {
+      maxTasks: 3,
+      timeoutMs: 30000,
+      autoUninstall: true,
+      endWhen: (log) => log.some(l => l.includes('uninstall skipped: next-day')),
+    });
+    check('next-day detected', has(r.log, 'uninstall skipped: next-day task'),
+      r.log.filter(l => l.includes('uninstall') || l.includes('claim ok')).join(' | '));
+    check('never uninstalled', !has(r.log, 'bridge.uninstall'),
+      r.log.filter(l => l.includes('uninstall')).join(' | '));
   }
 
   console.log('\nresult: ' + pass + ' passed, ' + fail + ' failed');

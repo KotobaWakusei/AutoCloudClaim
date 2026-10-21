@@ -9,8 +9,10 @@
 1. 扫描福利中心「赚碎片兑云空间」任务卡片，按状态点击：
    `下载安装` → 真实下载安装 → `立即打开` → 按卡片要求停留 N 秒 → 回到云服务 → `领取`
 2. 用 `PackageManager` 轮询确认新包确实已安装；宿主进程看不到包列表时自动退回 `su -c pm list packages -3`
-3. 领取成功（三重证据确认）后，可选自动卸载本次新装的应用
+3. 领取成功（三重证据确认）后，可选自动卸载本次新装的应用——**智能关联**：只有「刚领的这张卡
+   = 刚安装的那张卡」时才卸载；次留/隔日类任务自动保留（详见「智能卸载」）
 4. 全程受 `max` / 40 分钟看门狗 / `STOP` 广播约束；同一张卡片失败后进入冷却，**不会无限重点击**
+5. 尽量不打扰：自动导航重试带退避、安装看门狗放宽到 2 分钟才回前台
 
 **不做**（硬边界，代码里根本没有对应实现）：
 
@@ -151,13 +153,30 @@ adb shell am broadcast -a com.opautocloud.claim.STOP
 root 机可用 `su -c 'am broadcast …'`。状态在 LSPosed 日志里实时可见
 （`[AutoCloud][JS] …`）。
 
+### 真机调试脚本（`tools/dev.sh`）
+
+用 adb 做「构建 → 安装 → 跑 → 看日志」的闭环：
+
+```bash
+tools/dev.sh build      # 只构建
+tools/dev.sh install    # 构建 + 安装（并提示首次需要在 LSPosed 里启用）
+tools/dev.sh dry        # 干跑：dump 页面结构，不点任何东西（校准选择器用）
+tools/dev.sh run --max 3 --dwell 60 --ez uninstall true
+tools/dev.sh dump       # 打印最近一次日志里的 DUMP
+tools/dev.sh log        # 实时抓 LSPosed 日志
+tools/dev.sh stop       # 停止
+```
+
+脚本只依赖 `adb`；构建时优先用 `/home/kali/.ac-toolchain` 里的 JDK 17 + Gradle 8.14.5
+（可用 `JAVA_HOME` / `GRADLE` / `SERIAL` 覆盖）。
+
 ## 参数（GUI 滑杆/开关 与 adb extra 一一对应）
 
 | Intent extra | GUI | 类型 | 默认 | 含义 |
 |---|---|---|---|---|
 | `max` | 最多领取次数 | int | 3 | 一次运行最多领几次碎片（看门狗之外的第二道闸） |
 | `dwell` | 默认停留秒数 | int | 60 | 卡片没写「浏览 N 秒」时的默认停留秒数 |
-| `uninstall` | 卸载开关 | boolean | false | 领取成功后卸载本次新装的应用 |
+| `uninstall` | 卸载开关 | boolean | false | 领取成功后卸载本次新装的应用（智能关联 + 次留自动保留） |
 | `dry` | 演示模式开关 | boolean | false | 只 dump 页面结构，不点击 |
 
 广播 action：`com.opautocloud.claim.START` / `.STOP` → 云服务；`com.opautocloud.claim.STATUS` ← 云服务。
@@ -246,7 +265,12 @@ adb logcat -s LSPosed-Bridge:V | grep AutoCloud
 
 **延时切前台**：点「立即打开」前先调 `Bridge.scheduleReturn(sec)`，把 `bringToFront` 排进
 **Kotlin 主线程 Handler**。WebView 的 JS 定时器在应用退后台后会被 ROM 冻结（ColorOS 尤甚），
-只靠脚本里的 `setTimeout` 永远等不到回来的那一刻。
+只靠脚本里的 `setTimeout` 永远等不到回来的那一刻。`doInstall`（点「下载安装」后 90 秒看门狗）
+与 `doGo`（`dwell+10s`）也各自排一份，防止商店/外部应用接管前台后轮询与计时永远停摆；
+`finishRun` 会同步取消未触发的挂起任务，避免收工后云服务自己跳前台。
+
+**shell 超时**：`Bridge` 的 shell 调用（`su -c pm list packages -3` / 卸载）统一带 8 秒
+超时——`su` 等待授权弹窗、`pm` 挂起时若不设上限，会永久阻塞 JavaBridge 线程，整个自动化假死。
 
 **打开计时**：`openAppCountTime` 这条链路是原生的，Hook 能拿到真实数据——
 `PayOpenAppCountTimeExecute.openAppAndStartTracking` 记下 `packageName` + `remainingTime`，
@@ -260,10 +284,6 @@ adb logcat -s LSPosed-Bridge:V | grep AutoCloud
 **不需要 root**。仅当该权限被系统/用户回收时可见包数会掉到个位数，此时自动退回
 `su -c pm list packages -3`（结果缓存 10 秒，避免安装轮询期间反复 fork `su`）。
 
-**URL 匹配**：`/profit` 路径由服务端下发，APK 里没有硬编码（反编译无该字面量）。
-`State.isProfitUrl()` 要求路径里出现 `/profit` 且后面是结束、`/`、`?` 或 `#`，
-兼容 SPA 子路由与无尾斜杠，同时排除 `/profits` 之类误匹配。
-
 **自动导航**（`AutoNav` 对象）：START 后若不在福利中心页，Hook 在宿主进程内自动跳转。
 链路（反编译确认）：`wo.c.f40427f.q(WebUrlConstants$UrlType.WELFARE_CENTER)` 构建 URL
 （路径固定 `/cloud/welfarecenter.html`，域名来自服务端 `cloudconfig.g()`），
@@ -271,7 +291,35 @@ adb logcat -s LSPosed-Bridge:V | grep AutoCloud
 启动 `CloudWebBusinessActivity`。`CloudWebBusinessActivity` 虽 `exported=false`，
 但 Hook 跑在 `com.heytap.cloud` 同进程同 UID，可直接调用。
 Activity 前台化由 `Application.ActivityLifecycleCallbacks` 跟踪；
-URL 未就绪（云配置未加载）时每 2 秒重试，最多 12 次；进入福利中心页后自动取消。
+URL 未就绪（云配置未加载）时按退避节奏重试（2s → 4s → 6s → 8s），最多 12 次；
+进入福利中心页后自动取消。
+
+**URL 匹配**：`/profit` 路径由服务端下发，APK 里没有硬编码（反编译无该字面量）。
+`State.isProfitUrl()` 按**路径段**精确匹配：把 query/fragment 切掉后，路径里必须存在恰好等于
+`profit`（或 `profit.html`）的那一段。fragment（`…#/profit`）单独按段判定。
+这样既兼容 SPA 子路由（`/profit`、`/profit/detail`），又能排除两类误判：
+`?from=/profit` 这种带 query 的落地页（子串匹配会误认成任务页，导致自动导航被跳过）、
+以及 `/profits` 之类相邻段。
+
+**注入链补全**：除了基类 `WebViewClient.onPageFinished`，还会动态给运行期的
+`WebViewClient` **子类**补挂同一钩子——宿主若在子类里覆写且不回调 `super`，
+`goBack` / `reload` 场景会漏注入。另外 `loadUrl(String)` 与 `loadUrl(String, Map)`
+两个重载都挂了（部分 web 框架带 referer 头加载，漏挂会让页面缺桥）。
+
+**智能卸载**（`cleanupNewPackages`）：
+只有「本次领取成功的卡」就是「本次安装的卡」时才卸载对应的新装包，判定用两级：
+① DOM 元素级（卡片对象同一性，最可靠——真机上安装后按钮文案会从「开始安装」变成「已安装」，
+文本指纹会漂移）；② 退化到卡片文案指纹。
+旧逻辑是「任何卡领取成功就清空待卸载列表」，会把还没轮到领取的另一张卡的 app 删掉，
+直接让那个任务作废。此外，卡片文案命中 `次留|次日|隔日|明日|明天|…天后|第二天|第2天`
+的**次留类任务永远不卸载**——服务端次日会复核应用是否还在，卸了必判未完成。
+
+**尽量无感**：
+- 自动导航重试带指数退避（2s → 4s → 6s → 8s，累计约 65 秒），不再 2 秒一轮死等；
+- 安装看门狗从 90 秒放宽到 **120 秒**：商店通常立刻接管前台，WebView 的 JS 定时器在退后台后
+  会被 ROM 冻结（尤其 ColorOS），只有靠 Kotlin 侧的延时切前台才能推进安装轮询。
+  放宽后更少把用户从商店里拽回来；
+- 面板参数（次数/停留/卸载/演示）用 `rememberSaveable` 保存，进程重建不再丢设置。
 
 **执行结构**：
 ```
@@ -291,11 +339,14 @@ app/src/main/assets/xposed_init            模块入口类名
 app/src/main/res/values/arrays.xml         xposed_scope = com.heytap.cloud
 app/src/main/res/values[-night]/themes.xml Material 系统主题（配 edge-to-edge）
 app/src/main/java/com/opautocloud/claim/
-├── MainHook.kt         入口：State(含 publish) / AutoNav / Trigger / Injector + 三个 hook
+├── MainHook.kt         入口：State(含 publish) / AutoNav / Trigger / Injector + 注入与导航 hook
 ├── Bridge.kt           JS 桥 window.autocloud（状态查询 + 启动/延时返回/卸载 + status 上报）
 ├── Script.kt           注入的自动化脚本（任务状态机循环 + 冷却 + 三重领取确认）
 ├── UpdateChecker.kt    GitHub Release 更新检查（查询 latest release tag）
 └── ui/MainActivity.kt  Material 3 控制面板（Compose）
+tools/dev.sh                       真机调试脚本（构建/安装/干跑/抓日志）
+test/script.test.js                注入脚本行为测试（27 项）
+test/probe.test.js                 JS 桥探测结果解析测试（10 项）
 ```
 
 ## 已知限制
@@ -306,7 +357,10 @@ app/src/main/java/com/opautocloud/claim/
   只是这两种场景会失效。
 - **次留 / 注册类任务无法自动化**：次留要等 24 小时且服务端复核，注册无法被真实验证，
   这两类脚本会 `SKIP`，请手工做。
-- **领完立刻卸载可能让次留/审核类任务被服务端判为未完成**，所以 `uninstall` 默认关闭。
+- **智能卸载的两条边界**：① 只有「领的那张卡」就是「装的那张卡」时才卸，避免把还没轮到
+  领取的卡的 app 删掉；② 次留/隔日类卡片自动跳过卸载（服务端次日会复核应用是否还在）。
+  但「审核中」「连续签到」这类文案不明显、又需要次日复核的任务，识别可能不够准，
+  这类建议手动确认后再开卸载。
 - **停留时长可能被高估**：应用退后台后 JS 定时器会被冻结，醒来时实际停留时间通常比设定的
   长。对「至少停留 N 秒」类任务是安全方向，但如果服务端要求「不超过 N 秒」就会判失败。
 - 任务状态由服务端定时刷新，脚本遇到「无按钮」会滚动 + 轮询，不会硬点。

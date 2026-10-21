@@ -7,6 +7,7 @@ import android.os.Looper
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import de.robv.android.xposed.XposedBridge
+import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -36,7 +37,54 @@ class Bridge(private val wv: WebView) {
     @Volatile private var shellPkgsCache = ""
     @Volatile private var shellPkgsAt = 0L
 
+    /**
+     * shell 命令的等待上限。
+     *
+     * `su` 在等待 root 授权、`pm` 挂起时都会一直活着；没有超时的话 readText()/waitFor()
+     * 会永久阻塞。所有 @JavascriptInterface 调用共享同一条 JavaBridge 线程，
+     * 一次不返回的 shell 调用会让整个自动化（安装检测/切前台/卸载）全部卡死。
+     */
+    private val SHELL_TIMEOUT_MS = 8_000L
+
     @JavascriptInterface fun isRunning(): Boolean = State.running
+
+    /**
+     * 多 WebView 领导选举：只有当前实例是「最后 attach 且仍在 profit 页」的 WebView 时才扫描。
+     * 其余实例 standby，避免同一任务被两个文档重复点击（真机见 click OPEN ×2）。
+     * 领导的 WebView 被销毁或离开 profit 页时， standby 实例接管。
+     */
+    @JavascriptInterface
+    fun isLeader(): Boolean {
+        // 只在锁内取引用/改状态，URL 读取必须放锁外：Injector.attach 在主线程
+        // 也拿 leaderLock，而 WebView.getUrl 内部会把工作派发到 UI 线程，
+        // 锁内同步读 URL 时两边可能互相等死（JavaBridge 等锁释放 × 主线程等 getUrl 结果）。
+        val lead = synchronized(State.leaderLock) {
+            val cur = State.activeWebView?.get()
+            if (cur === wv) return true
+            cur
+        } ?: run {
+            // 参考已销毁/未设置：锁内二次确认后接管，防止两个实例同时抢先
+            synchronized(State.leaderLock) {
+                if (State.activeWebView?.get() == null) {
+                    State.activeWebView = WeakReference(wv)
+                    return true
+                }
+            }
+            return false
+        }
+        val leadOnProfit = runCatching { State.isProfitUrl(lead.url) }
+            .getOrDefault(true) // 读不到 URL 时保守维持现领导，避免双主
+        if (!leadOnProfit) {
+            synchronized(State.leaderLock) {
+                val now = State.activeWebView?.get()
+                if (now == null || now === lead) {
+                    State.activeWebView = WeakReference(wv)
+                    return true
+                }
+            }
+        }
+        return false
+    }
     @JavascriptInterface fun maxTasks(): Int = State.maxTasks
     @JavascriptInterface fun dwell(): Int = State.dwellSec
     @JavascriptInterface fun autoUninstall(): Boolean = State.autoUninstall
@@ -71,6 +119,9 @@ class Bridge(private val wv: WebView) {
     /** 本轮任务自然结束（达到上限 / 无任务可做 / 看门狗），复位运行标志让面板恢复可点。 */
     @JavascriptInterface
     fun finishRun() {
+        // 一轮结束后，挂起的「延时切前台」不能让它再触发：否则收工后几十秒内
+        // 云服务会突然自己跳到前台，打断用户正在做的事。
+        cancelReturn()
         State.running = false
         State.publish(app, phase = "已停止")
     }
@@ -183,6 +234,29 @@ class Bridge(private val wv: WebView) {
     fun bringToFront(): Boolean = bringToFrontNow()
 
     private fun bringToFrontNow(): Boolean {
+        // 优先把任务页所在的 WebView Activity 原样拉回前台。
+        // 用 getLaunchIntentForPackage 会落到云服务首页，脚本丢任务页后无法领取，
+        // 2026-10-13 真机复现（click OPEN → scheduled return → 回首页后静默卡死）。
+        val webAct = AutoNav.currentCloudActivity()
+        if (webAct != null) {
+            val resumed = runCatching {
+                onMainSync(2_000) {
+                    val i = Intent(webAct, webAct.javaClass)
+                    i.addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
+                    app.startActivity(i)
+                }
+            }.getOrDefault(false)
+            if (resumed) {
+                XposedBridge.log(
+                    "[AutoCloud] bringToFront: resumed task activity " + webAct.javaClass.name
+                )
+                return true
+            }
+        }
         val intent = runCatching {
             app.packageManager.getLaunchIntentForPackage(State.TARGET_PKG)
         }.getOrNull()
@@ -289,14 +363,51 @@ class Bridge(private val wv: WebView) {
     private fun shellCapture(command: Array<String>): String =
         shellCaptureWithExit(command)?.second.orEmpty()
 
-    /** 返回 (退出码, 合并后的 stdout+stderr)；进程起不来时返回 null。 */
+    /**
+     * 返回 (退出码, 合并后的 stdout+stderr)；进程起不来时返回 null。
+     *
+     * 带超时（SHELL_TIMEOUT_MS）：stdout 异步读 + waitFor(timeout)。
+     * 纯同步 readText() 在 `su` 等待授权时会永久挂起；先 readText 再 waitFor
+     * 还有 pipe 写满互等的经典死锁（进程卡在 write，EOF 永远不来）。
+     */
     private fun shellCaptureWithExit(command: Array<String>): Pair<Int, String>? = try {
         val p = ProcessBuilder(*command)
             .redirectErrorStream(true)
             .start()
-        val output = p.inputStream.bufferedReader().use { it.readText() }
-        val exit = p.waitFor()
-        exit to output
+        val out = StringBuilder()
+        val sink = Thread {
+            runCatching {
+                p.inputStream.bufferedReader().use { r ->
+                    var line = r.readLine()
+                    while (line != null) {
+                        synchronized(out) { out.append(line).append('\n') }
+                        line = r.readLine()
+                    }
+                }
+            }
+        }
+        sink.isDaemon = true
+        sink.start()
+
+        val done = try {
+            p.waitFor(SHELL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (t: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!done) {
+            p.destroy()
+            if (!p.waitFor(1_000L, TimeUnit.MILLISECONDS)) p.destroyForcibly()
+            XposedBridge.log(
+                "[AutoCloud] shell timeout after ${SHELL_TIMEOUT_MS}ms: " +
+                    command.joinToString(" ")
+            )
+        }
+        sink.join(500L)
+
+        val exit = if (done) runCatching { p.exitValue() }.getOrDefault(124) else 124
+        val text = synchronized(out) { out.toString() }
+        exit to text
     } catch (t: Throwable) {
         XposedBridge.log(t)
         null

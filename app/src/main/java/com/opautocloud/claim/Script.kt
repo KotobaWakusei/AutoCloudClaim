@@ -20,8 +20,9 @@ object Script {
   if (!B) { return; }
 
   var S = {
-    run: false, started: 0, claimed: 0, idle: 0, busy: 0,
-    lastT: 0, beforePkgs: '', newPkgs: '', stop: '', lastUrl: location.href
+    run: false, started: 0, claimed: 0, idle: 0, busy: 0, standby: false,
+    lastT: 0, beforePkgs: '', newPkgs: '', stop: '', lastUrl: location.href,
+    instSig: '', instNextDay: false, instCard: null
   };
   window.__AC = S;
 
@@ -33,7 +34,9 @@ object Script {
   function txt(el) { return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(); }
   function vis(el) {
     var r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && r.top < 30000 && r.bottom > -3000;
+    // bottom>0：排除已滚出视口上方的元素（真机复现 top=-316 的「打开」被点到，
+    // 2026-10-14）；下方未滚动到的仍允许（JS click 不需要用户手势），由 scrollNext 逐步推进。
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < 30000;
   }
 
   // 黑名单：花钱的、关闭类的、以及无法被真实验证的（注册类一律留给人工）
@@ -47,11 +50,15 @@ object Script {
   function pool() { return document.querySelectorAll('button,[role="button"],a,div,span'); }
 
   // 在候选元素里找「文字精确匹配 + 可见 + 未禁用 + 面积最小」的那个（最小面积 ≈ 真正的按钮）
-  function findBtn(re) {
+  // inCard=true：只认任务卡片里的按钮。profit 页顶部有任务切换 pill（也写着
+  // 「打开/安装中」），点了会把任务墙切到别的任务（ZTID 变化，2026-10-14 真机
+  // 复现），必须把这类元素排除在动作候选之外。
+  function findBtn(re, inCard) {
     var all = pool(), best = null, bestScore = -1e9;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!vis(el)) continue;
+      if (inCard && cardOf(el) === document.body) continue;
       if (el.getAttribute('data-ac-skip')) continue;
       var t = txt(el);
       if (!t || t.length > 32 || !re.test(t) || BLACK.test(t)) continue;
@@ -244,12 +251,36 @@ object Script {
     log('DUMP other-text=' + (other.length ? other.slice(0, 60).join(' | ') : 'none'));
   }
 
-  // 领取成功后（服务端已确认）再考虑卸载本次新装的应用
-  function cleanupNewPackages() {
+  // 领取成功后（服务端已确认）再考虑卸载本次新装的应用。
+  // 判定必须「领取的这张卡 = 刚安装的那张卡」：旧逻辑任何卡领取成功都会清空
+  // S.newPkgs，可能把还没轮到领取的另一张卡的 app 删掉（任务作废）。
+  // 次留/隔日类任务永远不卸——卸了之后服务端复核会判未完成。
+  function cleanupNewPackages(sig, claimCard) {
     if (!B.autoUninstall()) return;
+    var same = false;
+    if (S.instCard && claimCard && S.instCard === claimCard) {
+      same = true;                     // 同一张卡：DOM 元素级判定，最可靠
+    } else if (sig && S.instSig && sig === S.instSig) {
+      same = true;                     // 退化路径：卡片文案指纹相同
+    }
+    if (!same) {
+      if (sig && S.instSig && sig !== S.instSig) {
+        log('uninstall skipped: claim card != install card (' + sig.slice(0, 24) +
+            ' != ' + S.instSig.slice(0, 24) + ')');
+      }
+      return;
+    }
+    if (S.instNextDay) {
+      log('uninstall skipped: next-day task, keep ' + S.newPkgs);
+      return;
+    }
     var pkgs = S.newPkgs;
-    if (!pkgs && S.lastT) pkgs = B.newPackagesSince(S.lastT);
-    if (!pkgs) return;
+    if (!pkgs) {
+      // 不用 newPackagesSince 兜底：那是「本次会话期间新出现的所有包」，
+      // 会把用户自己刚装的 app 一起卸掉。只卸我们明确确认装上的那一个。
+      log('uninstall skipped: no confirmed package to remove');
+      return;
+    }
     var arr = pkgs.split(',');
     for (var i = 0; i < arr.length; i++) {
       if (!arr[i]) continue;
@@ -258,6 +289,9 @@ object Script {
     }
     S.newPkgs = '';
     S.lastT = 0;
+    S.instSig = '';
+    S.instNextDay = false;
+    S.instCard = null;
   }
 
   // 领取确认的第三条证据：点击前记录卡片指纹，等待窗口结束后同指纹卡片里
@@ -365,7 +399,7 @@ object Script {
       markOk(key);
       st('领取成功 · ' + after + ' 碎片');
       log('claim ok by ' + evidence + ' claimed=' + S.claimed);
-      cleanupNewPackages();
+      cleanupNewPackages(sig, cardOf(claim));
     } else {
       log('claim not confirmed after 15s (evidence=none); cooling down');
       markFail(key, claim, 3, 20000);
@@ -388,7 +422,9 @@ object Script {
     // 可能被厂商（尤其 ColorOS）冻结，若只靠下面的 bringToFront 会永远执行不到。
     try { B.scheduleReturn(sec + 5); } catch (e) {}
 
-    log('click OPEN "' + txt(open) + '" fallbackDwell=' + sec + 's');
+    log('click OPEN "' + txt(open) + '" fallbackDwell=' + sec + 's' +
+        ' at=' + String(open.tagName).toLowerCase() +
+        ',' + Math.round(open.getBoundingClientRect().top));
     st('正在启动任务应用');
     click(open);
 
@@ -421,6 +457,7 @@ object Script {
 
     var sdkVerified = false;
     var left = -1;
+    var frontRetried = false;
     for (var resultWait = 0; resultWait < 80; resultWait++) {
       var resultNow = B.sdkTrackVersion();
       var duration = B.sdkTrackDurationSec();
@@ -437,6 +474,12 @@ object Script {
           st('SDK 判定仍差 ' + left + ' 秒');
         }
         break;
+      }
+      // 首次 bringToFront 失败（后台启动限制）时 SDK 结果永远不会来，
+      // 4 秒后兜底再拉一次前台，最多一次，避免在这 8 秒窗口里盲等。
+      if (!frontRetried && resultWait === 40) {
+        frontRetried = true;
+        try { B.bringToFront(); } catch (e) {}
       }
       await sleep(100);
     }
@@ -474,6 +517,12 @@ object Script {
     }
 
     var wantPkg = pkgOf(ic);
+    // 智能卸载上下文：记住「这张卡」本身与它的文案指纹；领取确认只认这张卡。
+    // 元素引用最可靠（真机上安装后按钮文案会变，文本指纹会漂移）。
+    // 次留/隔日类任务装了也不卸（卸了服务端复核必判未完成）。
+    S.instCard = ic;
+    S.instSig = sigOf(inst);
+    S.instNextDay = /次留|次日|隔日|明日|明天|.{0,6}天后|第二天|第2天/.test(txt(ic));
     // 以安装前包集合为基准做差集；这比 firstInstallTime 可靠，尤其是恢复备份/系统时间异常时。
     S.beforePkgs = B.installedPackages();
     S.lastT = B.now();
@@ -481,6 +530,12 @@ object Script {
         ' baselinePkgs=' + String(S.beforePkgs || '').split(',').filter(Boolean).length);
     st('下载安装中');
     click(inst);
+
+    // 商店通常立刻接管前台，退后台后 WebView 的 JS 定时器可能被 ROM 冻结
+    // （尤其 ColorOS），下面的安装轮询会整个停摆，只能等用户手动切回。
+    // 排一次 Kotlin 侧延时切前台当看门狗：2 分钟后仍在商店才强制回云服务，
+    // 尽量少打断用户对商店的操作；脚本（未完成的轮询）在解冻后继续推进。
+    try { B.scheduleReturn(120); } catch (e) {}
 
     var installed = '';
     for (var i = 0; i < 90; i++) {
@@ -499,6 +554,8 @@ object Script {
       if (!B.isRunning()) break;
     }
 
+    // 检测已出结果/超时/被停止：不再需要那份切回看门狗
+    try { B.cancelReturn(); } catch (e) {}
     if (!installed) {
       log('install timeout: no new package detected (wantPkg=' +
           (wantPkg || 'unknown') + ')');
@@ -527,8 +584,13 @@ object Script {
 
     var gsec = dwellOf(gc);
     log('click GO "' + txt(go) + '" wait=' + gsec + 's');
+    // GO 任务经常把云服务切到后台（外部页面/应用），此时 JS 的定时被冻结，
+    // 下面的 sleep 永远走不完，只能等用户手动切回。靠 Kotlin 侧看门狗到点拉回
+    // （页内导航时该调用是 no-op，无影响）。
+    try { B.scheduleReturn(gsec + 10); } catch (e) {}
     click(go);
     await sleep(gsec * 1000 + 3000);
+    try { B.cancelReturn(); } catch (e) {}
     markOk(key);
     S.idle = 0;
   }
@@ -543,8 +605,17 @@ object Script {
     S.busy = 0;
     S.newPkgs = '';
     S.stop = '';
+    S.instSig = '';
+    S.instNextDay = false;
+    S.instCard = null;
     cool = {};
     failCnt = {};
+    // 上一轮被放弃（data-ac-skip）的卡片本轮重新给机会：用户再次点「开始」
+    // 本身就是重试意图；不清除的话，重开之后再也就点不到那些卡了。
+    try {
+      var skipped = document.querySelectorAll('[data-ac-skip]');
+      for (var si = 0; si < skipped.length; si++) skipped[si].removeAttribute('data-ac-skip');
+    } catch (e) {}
     log('START max=' + B.maxTasks() + ' dwell=' + B.dwell() +
         ' uninstall=' + B.autoUninstall() + ' dry=' + B.dryRun() +
         ' fragCounter=' + (fragFound() ? 'found' : 'MISSING'));
@@ -557,25 +628,34 @@ object Script {
       if (!B.isRunning()) { log('STOP trigger off'); S.stop = '已停止'; break; }
       if (S.claimed >= B.maxTasks()) { log('STOP reached max=' + B.maxTasks()); S.stop = '完成 · 已达上限'; break; }
 
+      // 多 WebView 领导选举：同页可能有多个文档实例，只有领导负责点按钮，
+      // 其余 standby（保持心跳，领导销毁后自动接管），避免同一任务被点两次。
+      if (!B.isLeader()) {
+        if (!S.standby) { S.standby = true; log('standby: another profit instance is active'); }
+        await sleep(1500);
+        continue;
+      }
+      if (S.standby) { S.standby = false; log('standby released: became leader'); }
+
       // 1) 优先领取（只有服务端已置为可领取时才会出现这个按钮）
-      var claim = findBtn(CLAIM);
+      var claim = findBtn(CLAIM, true);
       if (claim) { await doClaim(claim); continue; }
 
       // 2) 打开应用：优先使用 11.3.5 TaskWall SDK 给出的真实 remainingTime，
       //    页面文案只作为 SDK 未介入时的 fallback。
-      var open = findBtn(OPEN);
+      var open = findBtn(OPEN, true);
       if (open) { await doOpen(open); continue; }
 
       // 3) 触发下载/安装（真实下载，由应用商店与服务端归因校验）
-      var inst = findBtn(INSTALL);
+      var inst = findBtn(INSTALL, true);
       if (inst) { await doInstall(inst); continue; }
 
       // 4) 通用「去完成/去浏览」：页内浏览型任务
-      var go = findBtn(GO);
+      var go = findBtn(GO, true);
       if (go) { await doGo(go); continue; }
 
       // 5) 处理中（下载中/审核中…）：最多等 4 分钟，仍卡住就收工
-      if (findBtn(BUSY)) {
+      if (findBtn(BUSY, true)) {
         S.busy++;
         if (S.busy > 40) { log('STOP busy timeout'); S.stop = '停止 · 等待处理超时'; break; }
         await sleep(6000);

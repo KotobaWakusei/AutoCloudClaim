@@ -81,20 +81,45 @@ object State {
     val injected: MutableSet<WebView> = Collections.newSetFromMap(WeakHashMap())
 
     /**
+     * 多 WebView 领导选举：福利中心 H5 会在多个 WebView/Activity 里同时加载 profit 页，
+     * 每个文档各自注入脚本会重复点同一任务（2026-10-13 真机复现 click OPEN ×2）。
+     * 同一时刻只允许「最后 attach 且仍在 profit 的」那个实例扫描，其余 standby。
+     */
+    val leaderLock = Any()
+    @Volatile var activeWebView: WeakReference<WebView>? = null
+
+    /**
      * 福利中心 H5 的 URL 判定。
      *
-     * 路径 `/profit/` 由服务端下发，APK 里没有硬编码（反编译核对无 `profit` 字面量），
-     * 这里按观测到的 `…/profit/index.html` 匹配。SPA 子路由可能是 `…/profit`（无尾斜杠）
-     * 或 `…/profit/detail`，因此只要求路径里出现 `/profit` 这一段即可。
+     * 观测到的任务页是 `…/profit/index.html`；SPA 子路由可能是 `…/profit`（无尾斜杠）
+     * 或 `…/profit/detail`。按「路径段」精确匹配，防两种误判：
+     *  - 入口 URL 可能带 query（如 `?from=/profit`），子串匹配会把福利中心落地页
+     *    误认成任务页 → 自动导航被跳过、脚本被注入到错误页面后空转到底；
+     *  - `/profits`、`/xprofit/` 之类相邻段。
+     * fragment（`…#/profit`）是 SPA 子路由的合法写法，单独按段判定。
      */
     fun isProfitUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
-        val i = url.indexOf("/profit")
-        if (i < 0) return false
-        val end = i + "/profit".length
-        // `/profit` 后面要么结束，要么是 `/`、`?`、`#`，避免误匹配 `/profits` 之类
-        return end >= url.length || url[end] == '/' || url[end] == '?' || url[end] == '#'
+        val cut = url.indexOfAny(charArrayOf('?', '#'))
+        val path = if (cut >= 0) url.substring(0, cut) else url
+        val hash = url.indexOf('#')
+        val fragmentPath = if (hash >= 0) {
+            "/" + url.substring(hash + 1).substringBefore('?')
+        } else null
+        return hasProfitSegment(path) || (fragmentPath != null && hasProfitSegment(fragmentPath))
     }
+
+    /** 路径里是否存在恰好为 profit 的路径段（含 profit.html 变体）。 */
+    private fun hasProfitSegment(path: String): Boolean =
+        path.split('/').any { it == "profit" || it == "profit.html" }
+
+    /**
+     * 福利中心二级落地页（…/cloud/welfarecenter.html）。
+     * 2026-10-13 真机：welfarecenter 打开后是「做任务免费领空间」落地页，
+     * 不会总能自动跳转到 profit 任务列表，需要自动点击入口卡片。
+     */
+    fun isWelfareUrl(url: String?): Boolean =
+        !url.isNullOrBlank() && url.contains("/welfarecenter")
 
     /** 把状态回执广播给控制面板（同 APK 的 ui.MainActivity）。 */
     fun publish(
@@ -134,7 +159,14 @@ object State {
  */
 object AutoNav {
     private const val MAX_ATTEMPTS = 12
-    private const val RETRY_DELAY_MS = 2_000L
+
+    /** 退避间隔：前几次尝试得快，之后放宽——少打扰用户、给宿主云配置留出加载时间。 */
+    private fun retryDelayMs(): Long = when (attempts) {
+        in 1..2 -> 2_000L
+        in 3..4 -> 4_000L
+        in 5..6 -> 6_000L
+        else -> 8_000L
+    }
 
     @Volatile private var pending = false
     @Volatile private var attempts = 0
@@ -143,6 +175,12 @@ object AutoNav {
 
     fun bindClassLoader(cl: ClassLoader) {
         classLoader = cl
+    }
+
+    /** 最近一次前台化的宿主 Activity（供 Bridge 切回任务页用，排除启动器首页）。 */
+    fun currentCloudActivity(): Activity? {
+        val act = currentActivity?.get() ?: return null
+        return if (act.javaClass.name.contains("Launcher")) null else act
     }
 
     fun onActivityResumed(activity: Activity) {
@@ -187,13 +225,13 @@ object AutoNav {
 
         val activity = currentActivity?.get()
         if (activity == null || activity.isFinishing || activity.isDestroyed) {
-            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            State.main.postDelayed({ tryNavigate() }, retryDelayMs())
             return
         }
 
         val cl = classLoader
         if (cl == null) {
-            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            State.main.postDelayed({ tryNavigate() }, retryDelayMs())
             return
         }
 
@@ -201,7 +239,7 @@ object AutoNav {
         if (url.isNullOrBlank()) {
             XposedBridge.log("[AutoNav] welfare center URL not ready (attempt $attempts), retry")
             State.publish(activity, phase = "等待福利中心配置加载…")
-            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            State.main.postDelayed({ tryNavigate() }, retryDelayMs())
             return
         }
 
@@ -218,7 +256,7 @@ object AutoNav {
                 line = "AutoNav: 已触发跳转",
             )
         } else {
-            State.main.postDelayed({ tryNavigate() }, RETRY_DELAY_MS)
+            State.main.postDelayed({ tryNavigate() }, retryDelayMs())
         }
     }
 
@@ -319,43 +357,110 @@ class MainHook : IXposedHookLoadPackage {
         installTaskWallResultHook(lpparam.classLoader)
         installTaskWallTrackingHooks(lpparam.classLoader)
 
-        // 3) WebView 页面加载完成后注入自动化脚本
+        // 3) WebView 页面加载完成后注入自动化脚本（基类钩子）。
+        //    注意：宿主若在子类里覆写 onPageFinished 且不回调 super，基类钩子收不到；
+        //    下面的 setWebViewClient 钩子会动态给运行期子类补挂。
         XposedHelpers.findAndHookMethod(
             "android.webkit.WebViewClient", lpparam.classLoader,
             "onPageFinished", WebView::class.java, String::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val wv = param.args[0] as? WebView ?: return
-                    val url = param.args[1] as? String ?: return
-                    if (State.isProfitUrl(url)) {
-                        AutoNav.cancel()
-                        Injector.attach(wv, url)
-                    }
-                }
-            }
+            onPageFinishedHook()
         )
 
-        // 4) 兜底：SPA 首屏不一定走子类的 onPageFinished，loadUrl 后轮询一次
+        // 3b) 动态挂钩 WebViewClient 子类：云服务自己的 client 覆写 onPageFinished 的概率很高
+        //     （改标题/进度条），不回调 super 时 profit/be 页面在 goBack、reload 之类场景会漏注入。
         XposedHelpers.findAndHookMethod(
-            WebView::class.java, "loadUrl", String::class.java,
+            WebView::class.java, "setWebViewClient",
+            android.webkit.WebViewClient::class.java,
             object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val wv = param.thisObject as WebView
-                    val url = param.args[0] as? String ?: return
-                    // JavaScript interfaces added after onPageFinished are not exposed to the
-                    // current document until a subsequent navigation. Install before loadUrl.
-                    Injector.prepareForNavigation(wv, url)
-                }
-
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val wv = param.thisObject as WebView
-                    State.main.postDelayed({ tryAttach(wv) }, 1500)
-                    State.main.postDelayed({ tryAttach(wv) }, 5000)
+                    val client = param.args[0] as? android.webkit.WebViewClient ?: return
+                    hookClientOnPageFinished(client.javaClass)
                 }
-            }
+            },
         )
+
+        // 4) 兜底：SPA 首屏不一定走子类的 onPageFinished，loadUrl 后轮询一次。
+        //    同时挂 loadUrl(String, Map) 重载——某些 web 框架带 referer 头加载，
+        //    不挂钩的话进入页面的桥会缺位。
+        XposedHelpers.findAndHookMethod(
+            WebView::class.java, "loadUrl", String::class.java, loadUrlHook()
+        )
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                WebView::class.java, "loadUrl",
+                String::class.java, java.util.Map::class.java, loadUrlHook()
+            )
+        }.onFailure {
+            XposedBridge.log("[AutoCloud] loadUrl(Map) hook unavailable: " + it)
+        }
 
         XposedBridge.log("[AutoCloud] loaded in " + lpparam.packageName)
+    }
+
+    /** 已经动态挂过钩的 WebViewClient 子类（弱集合，避免生命周期泄漏）。 */
+    private val hookedClientClasses = Collections.newSetFromMap(
+        WeakHashMap<Class<*>, Boolean>()
+    )
+
+    private fun onPageFinishedHook(): XC_MethodHook {
+        return object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val wv = param.args[0] as? WebView ?: return
+                val url = param.args[1] as? String ?: return
+                if (State.isProfitUrl(url)) {
+                    AutoNav.cancel()
+                    Injector.attach(wv, url)
+                } else if (
+                    State.isWelfareUrl(url) && State.running &&
+                    !State.injected.any { State.isProfitUrl(it.url) }
+                ) {
+                    XposedBridge.log("[AutoEntry] welfare landing detected url=$url")
+                    Injector.clickWelfareEntry(wv)
+                }
+            }
+        }
+    }
+
+    /**
+     * 给运行期 WebViewClient 子类补挂 onPageFinished。
+     * findAndHookMethod 只挂该类自己声明的方法；子类没覆写时基类钩子已覆盖，静默跳过即可。
+     */
+    private fun hookClientOnPageFinished(cls: Class<*>) {
+        if (cls == android.webkit.WebViewClient::class.java) return
+        if (!hookedClientClasses.add(cls)) return
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                cls, "onPageFinished",
+                WebView::class.java, String::class.java,
+                onPageFinishedHook(),
+            )
+            XposedBridge.log("[AutoCloud] hooked subclass onPageFinished " + cls.name)
+        }.onFailure {
+            // 未覆写的情况属正常：保留 add 的记录，避免每次 setWebViewClient 都刷失败日志
+            XposedBridge.log(
+                "[AutoCloud] subclass onPageFinished not declared (base hook covers): " +
+                    cls.name
+            )
+        }
+    }
+
+    /** loadUrl(String[, Map]) 共用钩子：进页前装桥 + 导航后兜底轮询 attach。 */
+    private fun loadUrlHook(): XC_MethodHook {
+        return object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val wv = param.thisObject as WebView
+                val url = param.args[0] as? String ?: return
+                // JavaScript interfaces added after onPageFinished are not exposed to the
+                // current document until a subsequent navigation. Install before loadUrl.
+                Injector.prepareForNavigation(wv, url)
+            }
+
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val wv = param.thisObject as WebView
+                State.main.postDelayed({ tryAttach(wv) }, 1500)
+                State.main.postDelayed({ tryAttach(wv) }, 5000)
+            }
+        }
     }
 
     private fun installTaskWallResultHook(classLoader: ClassLoader) {
@@ -457,7 +562,14 @@ class MainHook : IXposedHookLoadPackage {
     private fun tryAttach(wv: WebView) {
         try {
             val url = wv.url ?: return
-            if (State.isProfitUrl(url)) Injector.attach(wv, url)
+            if (State.isProfitUrl(url)) {
+                Injector.attach(wv, url)
+            } else if (
+                State.isWelfareUrl(url) && State.running &&
+                !State.injected.any { State.isProfitUrl(it.url) }
+            ) {
+                Injector.clickWelfareEntry(wv)
+            }
         } catch (t: Throwable) {
             XposedBridge.log(t)
         }
@@ -471,6 +583,82 @@ object Injector {
     private val preparedWebViews: MutableSet<WebView> =
         Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
     private val bridges = WeakHashMap<WebView, Bridge>()
+    private val welfareEntryAttempts = WeakHashMap<WebView, Int>()
+
+    /** 入口点击全局去抖：多个 WebView 同时看到福利页时只点一次，防止叠出多个 profit 页。 */
+    @Volatile private var lastWelfareClickAt = 0L
+
+    /**
+     * 福利中心二级落地页入口点击。
+     *
+     * 页面是 SPA，卡片渲染晚于 onPageFinished，因此 JS 自带评分选择 + Kotlin 侧重试。
+     * 只点「做任务免费领空间 / 免费领 200 GB 云空间」入口；
+     * 「0.1元升级」等付费卡打负分，永远不会被点。
+     */
+    private const val WELFARE_ENTRY_JS = """(function () {
+  var els = document.querySelectorAll('div,span,a,button,[role="button"]');
+  var best = null, bestScore = 0, bestText = '';
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 24) continue;
+    var s = 0;
+    if (/做任务免费领空间/.test(t)) s += 100;
+    if (/免费领\s*200\s*GB\s*云空间|免费领.{0,8}云空间/.test(t)) s += 80;
+    if (/0\.1元|首单|升级|购买|支付|套餐|续费/.test(t)) s -= 200;
+    if (s > bestScore) { best = el; bestScore = s; bestText = t; }
+  }
+  if (best) {
+    try { best.click(); } catch (e) {}
+    return 'clicked:' + bestScore + ':' + bestText;
+  }
+  return 'not-found';
+})()"""
+
+    fun clickWelfareEntry(wv: WebView) {
+        val attempt = welfareEntryAttempts[wv] ?: 0
+        if (attempt >= 25) return
+        welfareEntryAttempts[wv] = attempt + 1
+        State.main.postDelayed({
+            try {
+                if (
+                    !State.running || !State.isWelfareUrl(wv.url) ||
+                    State.injected.any { State.isProfitUrl(it.url) }
+                ) {
+                    // 已有 WebView 在 profit 任务页：不再重复点入口（防任务墙来回切换）
+                    welfareEntryAttempts.remove(wv)
+                    return@postDelayed
+                }
+                // 全局去抖：多个 WebView 几乎同时看到福利页时只允许一路点击，
+                // 否则每次点击都会叠出一个新的 profit Activity（真机见 AutoEntry ×3）。
+                val now = System.currentTimeMillis()
+                val since = now - lastWelfareClickAt
+                if (since < 4_000L) {
+                    State.main.postDelayed(
+                        { clickWelfareEntry(wv) },
+                        4_000L - since + 200L
+                    )
+                    return@postDelayed
+                }
+                lastWelfareClickAt = now
+                wv.evaluateJavascript(WELFARE_ENTRY_JS) { raw ->
+                    val result = raw?.trim('"') ?: ""
+                    if (result.startsWith("clicked")) {
+                        XposedBridge.log("[AutoEntry] $result")
+                        welfareEntryAttempts.remove(wv)
+                    } else if (State.running && State.isWelfareUrl(wv.url)) {
+                        // SPA 尚未渲染入口卡片，1s 后重试
+                        clickWelfareEntry(wv)
+                    } else {
+                        welfareEntryAttempts.remove(wv)
+                    }
+                }
+            } catch (t: Throwable) {
+                XposedBridge.log("[AutoEntry] failed: " + t)
+                welfareEntryAttempts.remove(wv)
+            }
+        }, 1_000L)
+    }
 
     /**
      * 每个 WebView 只保留一个 Bridge 实例。
@@ -516,6 +704,7 @@ object Injector {
                 }
                 attachedUrls[wv] = current
                 State.injected.add(wv)
+                synchronized(State.leaderLock) { State.activeWebView = WeakReference(wv) }
                 probeAndInject(wv, current, 0)
             } catch (t: Throwable) {
                 XposedBridge.log("[AutoCloud] attach failed url=$url: " + t.stackTraceToString())
