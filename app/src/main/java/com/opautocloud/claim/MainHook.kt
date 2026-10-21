@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -160,6 +161,91 @@ object State {
 object AutoNav {
     private const val MAX_ATTEMPTS = 12
 
+    /**
+     * 版本无关的导航兜底。
+     *
+     * 宿主 11.3.5 的福利中心 URL 由混淆类（wo.c / yl.d）拼出来，这些名字每
+     * 个 build 都会变（11.4.5 极可能已变），一失效就完全没法自动跳转。
+     *
+     * 这里换一条不依赖任何混淆名的路：
+     *  1) 钩住宿主自己的 WebView.loadUrl —— 宿主每次加载页面我们都能看到 URL；
+     *  2) 见到 /welfarecenter 或 /profit 的 URL 就学下来（内存 + 模块自己的
+     *     SharedPreferences，跨进程/跨版本都还在）；
+     *  3) 混淆链路失效时，用学到的 URL 丢给宿主自己的 WebView 去加载——
+     *     WebView 是宿主进程的，Cookie、JS 桥、归因上下文全都一样。
+     *
+     * 代价：宿主刚更新、还没加载过任何网页时没有可学的 URL，只能提示用户手动进一次。
+     */
+    object NavCache {
+        private const val PREFS = "ac_nav_cache"
+        private const val KEY_WELFARE = "welfare_url"
+        private const val KEY_PROFIT = "profit_url"
+
+        @Volatile var welfareUrl: String? = null
+        @Volatile var profitUrl: String? = null
+
+        /** 宿主最近用过的 WebView（弱引用）：兜底跳转时用它来 loadUrl。 */
+        @Volatile var lastWebView: WeakReference<WebView>? = null
+
+        private var prefs: SharedPreferences? = null
+
+        fun init(ctx: Context) {
+            if (prefs != null) return
+            runCatching {
+                // 写在模块自己的包名下，不污染宿主 App 的数据目录
+                val modCtx = ctx.createPackageContext(
+                    "com.opautocloud.claim", Context.CONTEXT_IGNORE_SECURITY
+                )
+                val sp = modCtx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                prefs = sp
+                welfareUrl = sp.getString(KEY_WELFARE, null)
+                profitUrl = sp.getString(KEY_PROFIT, null)
+            }.onFailure {
+                XposedBridge.log("[AutoNav] cache init failed: " + it)
+            }
+        }
+
+        /** 记下宿主加载过的 WebView 与 URL。 */
+        fun observe(wv: WebView?, url: String?) {
+            if (wv != null) lastWebView = WeakReference(wv)
+            if (url.isNullOrBlank()) return
+            runCatching {
+                when {
+                    State.isProfitUrl(url) -> {
+                        if (profitUrl != url) {
+                            profitUrl = url
+                            prefs?.edit()?.putString(KEY_PROFIT, url)?.apply()
+                            XposedBridge.log("[AutoNav] learned profit url: " + url)
+                        }
+                    }
+                    url.contains("/welfarecenter") -> {
+                        if (welfareUrl != url) {
+                            welfareUrl = url
+                            prefs?.edit()?.putString(KEY_WELFARE, url)?.apply()
+                            XposedBridge.log("[AutoNav] learned welfare url: " + url)
+                        }
+                    }
+                }
+            }
+        }
+
+        /** 用宿主自己的 WebView 打开一个已知 URL。成功返回 true。 */
+        fun openInHostWebView(url: String): Boolean {
+            val wv = lastWebView?.get() ?: return false
+            return runCatching {
+                State.main.post {
+                    runCatching {
+                        wv.loadUrl(url)
+                        XposedBridge.log("[AutoNav] fallback loadUrl: " + url)
+                    }.onFailure {
+                        XposedBridge.log("[AutoNav] fallback loadUrl failed: " + it)
+                    }
+                }
+                true
+            }.getOrDefault(false)
+        }
+    }
+
     /** 退避间隔：前几次尝试得快，之后放宽——少打扰用户、给宿主云配置留出加载时间。 */
     private fun retryDelayMs(): Long = when (attempts) {
         in 1..2 -> 2_000L
@@ -170,6 +256,7 @@ object AutoNav {
 
     @Volatile private var pending = false
     @Volatile private var attempts = 0
+    @Volatile private var fallbackTries = 0
     @Volatile private var classLoader: ClassLoader? = null
     @Volatile private var currentActivity: WeakReference<Activity>? = null
 
@@ -191,6 +278,7 @@ object AutoNav {
     fun requestNavigate() {
         pending = true
         attempts = 0
+        fallbackTries = 0
         State.main.postDelayed({ tryNavigate() }, 1_000L)
     }
 
@@ -237,6 +325,25 @@ object AutoNav {
 
         val url = runCatching { welfareCenterUrl(cl) }.getOrNull()
         if (url.isNullOrBlank()) {
+            // 混淆链路失效（宿主换版本）→ 走版本无关的兜底：
+            // 用学到的福利中心/任务页 URL，丢给宿主自己的 WebView 加载。
+            // 不在这里清 pending：页面加载成功后 onPageFinished 会自动 cancel。
+            val cached = NavCache.welfareUrl ?: NavCache.profitUrl
+            if (!cached.isNullOrBlank() && fallbackTries < 3) {
+                if (NavCache.openInHostWebView(cached)) {
+                    fallbackTries++
+                    XposedBridge.log(
+                        "[AutoNav] using cached url (obfuscated path unavailable, try " +
+                            "$fallbackTries): " + cached
+                    )
+                    State.publish(
+                        activity, phase = "正在自动进入福利中心…",
+                        line = "AutoNav: 用缓存地址跳转",
+                    )
+                    State.main.postDelayed({ tryNavigate() }, 3_000L)
+                    return
+                }
+            }
             XposedBridge.log("[AutoNav] welfare center URL not ready (attempt $attempts), retry")
             State.publish(activity, phase = "等待福利中心配置加载…")
             State.main.postDelayed({ tryNavigate() }, retryDelayMs())
@@ -407,6 +514,9 @@ class MainHook : IXposedHookLoadPackage {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val wv = param.args[0] as? WebView ?: return
                 val url = param.args[1] as? String ?: return
+                // 页面加载完也算一次「学习」：前进/后退/重定向不一定经过 loadUrl
+                AutoNav.NavCache.init(wv.context)
+                AutoNav.NavCache.observe(wv, url)
                 if (State.isProfitUrl(url)) {
                     AutoNav.cancel()
                     Injector.attach(wv, url)
@@ -450,6 +560,10 @@ class MainHook : IXposedHookLoadPackage {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val wv = param.thisObject as WebView
                 val url = param.args[0] as? String ?: return
+                // 学习宿主加载过的地址 + 记住它的 WebView：
+                // 混淆 API 换版本失效时，用这些学到的 URL 直接在宿主 WebView 里跳转。
+                AutoNav.NavCache.init(wv.context)
+                AutoNav.NavCache.observe(wv, url)
                 // JavaScript interfaces added after onPageFinished are not exposed to the
                 // current document until a subsequent navigation. Install before loadUrl.
                 Injector.prepareForNavigation(wv, url)
