@@ -213,6 +213,13 @@ object AutoNav {
                     params.size == 2 && params[0] == "android.app.Activity" &&
                         params[1] == "java.lang.String"
                 }.firstOrNull { it.isStatic }
+                    // isStatic 已由 DexScan 修复（读真实 access_flags），这里仍保留
+                    // 无过滤兜底：静态匹配缺失时退回任意签名匹配，调用侧按
+                    // isStatic 分支选择 callStaticMethod / callMethod。
+                    ?: DexScan.findMethods(apk) { params, ret ->
+                        params.size == 2 && params[0] == "android.app.Activity" &&
+                            params[1] == "java.lang.String"
+                    }.firstOrNull()
 
                 // 运营位配置：反查引用了配置 key 的方法（返回 Map 的那个）
                 configMapCache = DexScan.findMethodsReferencingString(apk, CONFIG_KEY)
@@ -242,7 +249,10 @@ object AutoNav {
                     f.get(null)
                 }.getOrNull() ?: continue
                 if (f.type == clazz) return v
-                if (fallback == null) fallback = v
+                // 只有 clazz（或其子类）的实例才能充当方法接收者；其他类型的静态
+                // 字段拿去 callMethod 必然 NoSuchMethodError。此前的盲选 fallback
+                // 正是这种，宁可返回 null 让调用侧走失败分支。
+                if (fallback == null && clazz.isInstance(v)) fallback = v
             }
             return fallback
         }
@@ -277,11 +287,18 @@ object AutoNav {
             val ref = configMapCache ?: return null
             return runCatching {
                 val clazz = XposedHelpers.findClass(ref.className, cl)
-                val target = if (ref.isStatic) clazz else (singletonOf(clazz) ?: return null)
+                // 静态方法必须走 callStaticMethod：以 java.lang.Class 对象为接收者
+                // 调 callMethod 时，Xposed 只会在 Class 类自身里找方法，必然失败
+                // （此前 isStatic 数据源错误掩盖了这条静态路径）。
+                val target: Any = if (ref.isStatic) clazz else (singletonOf(clazz) ?: return null)
                 // 形参：一个 String（运营位类型）时传 "10"，无参时不传
                 val map = when {
+                    ref.params.isEmpty() && ref.isStatic ->
+                        XposedHelpers.callStaticMethod(clazz, ref.methodName)
                     ref.params.isEmpty() ->
                         XposedHelpers.callMethod(target, ref.methodName)
+                    ref.params.size == 1 && ref.params[0] == "java.lang.String" && ref.isStatic ->
+                        XposedHelpers.callStaticMethod(clazz, ref.methodName, "10")
                     ref.params.size == 1 && ref.params[0] == "java.lang.String" ->
                         XposedHelpers.callMethod(target, ref.methodName, "10")
                     else -> return null
@@ -298,7 +315,14 @@ object AutoNav {
             val ref = launcherCache ?: return false
             return runCatching {
                 val clazz = XposedHelpers.findClass(ref.className, cl)
-                XposedHelpers.callStaticMethod(clazz, ref.methodName, activity, url)
+                if (ref.isStatic) {
+                    XposedHelpers.callStaticMethod(clazz, ref.methodName, activity, url)
+                } else {
+                    // 实例方法按实例调用：无条件 callStaticMethod 对实例方法必然抛错，
+                    // 且被 runCatching 吞成静默失败（bug 审计 High-2）。
+                    val inst = singletonOf(clazz) ?: return@runCatching false
+                    XposedHelpers.callMethod(inst, ref.methodName, activity, url)
+                }
                 true
             }.getOrDefault(false)
         }
@@ -680,15 +704,20 @@ class MainHook : IXposedHookLoadPackage {
                 // 页面加载完也算一次「学习」：前进/后退/重定向不一定经过 loadUrl
                 AutoNav.NavCache.init(wv.context)
                 AutoNav.NavCache.observe(wv, url)
+                Injector.observe(wv, url)
                 if (State.isProfitUrl(url)) {
                     AutoNav.cancel()
                     Injector.attach(wv, url)
-                } else if (
-                    State.isWelfareUrl(url) && State.running &&
-                    !State.injected.any { State.isProfitUrl(it.url) }
-                ) {
-                    XposedBridge.log("[AutoEntry] welfare landing detected url=$url")
-                    Injector.clickWelfareEntry(wv)
+                } else {
+                    // 桥跨导航存活：离开 profit 页就摘桥，敏感能力不再对任务外页面开放
+                    Injector.detachIfBridge(wv, url)
+                    if (
+                        State.isWelfareUrl(url) && State.running &&
+                        !State.injected.any { State.isProfitUrl(it.url) }
+                    ) {
+                        XposedBridge.log("[AutoEntry] welfare landing detected url=$url")
+                        Injector.clickWelfareEntry(wv)
+                    }
                 }
             }
         }
@@ -727,6 +756,10 @@ class MainHook : IXposedHookLoadPackage {
                 // 混淆 API 换版本失效时，用这些学到的 URL 直接在宿主 WebView 里跳转。
                 AutoNav.NavCache.init(wv.context)
                 AutoNav.NavCache.observe(wv, url)
+                Injector.observe(wv, url)
+                // 目标不是 profit 页时在加载前摘桥：removeJavascriptInterface 对
+                // 新文档立即生效，第三方页从源头上就看不到 window.autocloud。
+                Injector.detachIfBridge(wv, url)
                 // JavaScript interfaces added after onPageFinished are not exposed to the
                 // current document until a subsequent navigation. Install before loadUrl.
                 Injector.prepareForNavigation(wv, url)
@@ -897,6 +930,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun tryAttach(wv: WebView) {
         try {
             val url = wv.url ?: return
+            Injector.observe(wv, url)
             if (State.isProfitUrl(url)) {
                 Injector.attach(wv, url)
             } else if (
@@ -919,6 +953,47 @@ object Injector {
         Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
     private val bridges = WeakHashMap<WebView, Bridge>()
     private val welfareEntryAttempts = WeakHashMap<WebView, Int>()
+
+    /** 每个 WebView 最近一次被钩子观测到的 URL（钩子线程写，桥线程读，锁保护）。 */
+    private val observedUrls = WeakHashMap<WebView, String>()
+
+    /** 钩子每观测到一个 URL（loadUrl / onPageFinished）都记录，供桥门禁判定。 */
+    fun observe(wv: WebView, url: String) {
+        synchronized(observedUrls) { observedUrls[wv] = url }
+    }
+
+    /**
+     * 桥调用门禁：WebView 仍处于 profit 任务页时返回其 URL，否则 null。
+     *
+     * 桥一旦安装就跨导航存活（profit 页跳出的第三方页同样能看到 window.autocloud），
+     * 敏感方法因此必须在「调用时」再验一次当前页面，而不是只在安装时验一次。
+     * 用观测 URL 而非 wv.getUrl()：后者内部派发到主线程，JavaBridge 线程同步读
+     * 有与 Injector.attach 互等死锁的风险（见 Bridge.isLeader 注释）。
+     */
+    fun gateUrl(wv: WebView): String? {
+        val last = synchronized(observedUrls) { observedUrls[wv] }
+        return if (last != null && State.isProfitUrl(last)) last else null
+    }
+
+    /**
+     * 离开 profit 页时摘桥。removeJavascriptInterface 要到下一次导航才生效，
+     * 所以在 loadUrl before / onPageFinished 双点调用：前者让新文档直接见不到桥，
+     * 后者覆盖重定向等不经过 loadUrl 的导航；调用时门禁（gateUrl）兜住生效间隙。
+     */
+    fun detachIfBridge(wv: WebView, url: String) {
+        if (State.isProfitUrl(url)) return
+        if (!bridges.containsKey(wv)) return
+        State.main.post {
+            runCatching {
+                wv.removeJavascriptInterface("autocloud")
+                XposedBridge.log("[AutoCloud] bridge removed on non-profit page url=$url")
+            }
+            bridges.remove(wv)
+            preparedWebViews.remove(wv)
+            attachedUrls.remove(wv)
+            State.injected.remove(wv)
+        }
+    }
 
     /** 入口点击全局去抖：多个 WebView 同时看到福利页时只点一次，防止叠出多个 profit 页。 */
     @Volatile private var lastWelfareClickAt = 0L
@@ -1019,6 +1094,12 @@ object Injector {
             XposedBridge.log("[AutoCloud] pre-navigation bridge install failed: " + t)
         }
     }
+
+    /**
+     * 桥侧敏感能力门禁：桥方法开头调用，WebView 不在 profit 页时拒绝。
+     * 配合 Injector.observe（钩子点持续刷新观测 URL）与 detachIfBridge 双保险。
+     */
+    fun bridgeGate(wv: WebView): Boolean = gateUrl(wv) != null
 
     fun attach(wv: WebView, url: String) {
         State.main.post {

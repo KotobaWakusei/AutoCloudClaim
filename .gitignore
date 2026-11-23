@@ -23,3 +23,8 @@ captures/
 
 # generated test artifact
 test/script.body.js
+
+# 本机编译/审计辅助（不随仓库分发）
+.gradle-home/
+.bugref/
+.memory-digest-backup.md

@@ -131,16 +131,20 @@ class Bridge(private val wv: WebView) {
 
     /** 某个包是否已安装（本机 PackageManager，非伪造）。 */
     @JavascriptInterface
-    fun isInstalled(pkg: String): Boolean = try {
-        app.packageManager.getPackageInfo(pkg, 0)
-        true
-    } catch (t: Throwable) {
-        false
+    fun isInstalled(pkg: String): Boolean {
+        if (!gated()) return false
+        return try {
+            app.packageManager.getPackageInfo(pkg, 0)
+            true
+        } catch (t: Throwable) {
+            false
+        }
     }
 
     /** 返回当前已安装的非系统包名快照。由 JS 与安装前快照做差集，避免 firstInstallTime 时钟/恢复导致误判。 */
     @JavascriptInterface
     fun installedPackages(): String {
+        if (!gated()) return ""
         return try {
             val visible = app.packageManager.getInstalledPackages(0)
                 .asSequence()
@@ -198,18 +202,21 @@ class Bridge(private val wv: WebView) {
 
     /** 保留旧接口兼容性；时间条件仅作辅助，不再作为唯一安装判据。 */
     @JavascriptInterface
-    fun newPackagesSince(t: Long): String = try {
-        installedPackages()
-            .split(',')
-            .filter { it.isNotBlank() }
-            .filter { pkg ->
-                runCatching {
-                    app.packageManager.getPackageInfo(pkg, 0).firstInstallTime >= t
-                }.getOrDefault(false)
-            }
-            .joinToString(",")
-    } catch (err: Throwable) {
-        ""
+    fun newPackagesSince(t: Long): String {
+        if (!gated()) return ""
+        return try {
+            installedPackages()
+                .split(',')
+                .filter { it.isNotBlank() }
+                .filter { pkg ->
+                    runCatching {
+                        app.packageManager.getPackageInfo(pkg, 0).firstInstallTime >= t
+                    }.getOrDefault(false)
+                }
+                .joinToString(",")
+        } catch (err: Throwable) {
+            ""
+        }
     }
 
     /**
@@ -220,7 +227,7 @@ class Bridge(private val wv: WebView) {
      */
     @JavascriptInterface
     fun launch(pkg: String): Boolean {
-        if (!isValidPackage(pkg)) return false
+        if (!gated() || !isValidPackage(pkg)) return false
         val intent = runCatching { app.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
             ?: return false
         return onMainSync(2_000) {
@@ -231,7 +238,10 @@ class Bridge(private val wv: WebView) {
 
     /** 将云服务 App 切回前台；同步返回真实的启动结果。 */
     @JavascriptInterface
-    fun bringToFront(): Boolean = bringToFrontNow()
+    fun bringToFront(): Boolean {
+        if (!gated()) return false
+        return bringToFrontNow()
+    }
 
     private fun bringToFrontNow(): Boolean {
         // 优先把任务页所在的 WebView Activity 原样拉回前台。
@@ -278,6 +288,7 @@ class Bridge(private val wv: WebView) {
      */
     @JavascriptInterface
     fun scheduleReturn(delaySec: Int): Boolean {
+        if (!gated()) return false
         val sec = delaySec.coerceIn(1, 600)
         cancelReturn()
         val task = Runnable {
@@ -303,6 +314,14 @@ class Bridge(private val wv: WebView) {
     }
 
     // ---------- helpers ----------
+
+    /**
+     * 敏感能力门禁：桥跨导航存活（profit 页跳出的第三方页也能看到本桥），
+     * 所有「动设备」的方法在调用时必须确认 WebView 仍处于 profit 任务页。
+     * 观测 URL 由钩子（loadUrl/onPageFinished/tryAttach）持续刷新，避免在
+     * JavaBridge 线程同步读 getUrl() 造成死锁风险。
+     */
+    private fun gated(): Boolean = Injector.bridgeGate(wv)
 
     /** 在主线程同步执行 [block]，最多等 [timeoutMs]；已在主线程时直接执行。 */
     private fun onMainSync(timeoutMs: Long, block: () -> Unit): Boolean {
@@ -341,7 +360,8 @@ class Bridge(private val wv: WebView) {
      */
     @JavascriptInterface
     fun uninstall(pkg: String): Boolean {
-        if (!State.autoUninstall || !isValidPackage(pkg)) return false
+        // 门禁排在最前：autoUninstall 开关 + 非 profit 页（桥被第三方页触达）都直接拒绝
+        if (!gated() || !State.autoUninstall || !isValidPackage(pkg)) return false
         if (pkg == State.TARGET_PKG || pkg == app.packageName) return false
         val a = shell(arrayOf("pm", "uninstall", "--user", "0", pkg))
         if (a) return true

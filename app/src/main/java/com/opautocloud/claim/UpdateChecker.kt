@@ -42,6 +42,7 @@ object UpdateChecker {
 
             val code = conn.responseCode
             if (code != 200) {
+                android.util.Log.w("AutoCloudUpdate", "release check HTTP $code")
                 return Result(false, "", 0, RELEASES_URL, "")
             }
 

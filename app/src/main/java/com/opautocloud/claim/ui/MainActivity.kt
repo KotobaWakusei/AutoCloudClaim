@@ -154,11 +154,15 @@ fun ControlScreen() {
         }
     }
 
-    // 启动时检查 GitHub 更新
+    // 启动时检查 GitHub 更新（失败仅 Log.w 留痕，不打扰用户）
     LaunchedEffect(Unit) {
         updateChecking = true
         val result = withContext(Dispatchers.IO) {
-            runCatching { UpdateChecker.check(BuildConfig.BUILD_NUMBER) }.getOrNull()
+            runCatching { UpdateChecker.check(BuildConfig.BUILD_NUMBER) }
+                .onFailure {
+                    android.util.Log.w("AutoCloudUpdate", "release check failed", it)
+                }
+                .getOrNull()
         }
         updateChecking = false
         if (result != null && result.hasUpdate) {

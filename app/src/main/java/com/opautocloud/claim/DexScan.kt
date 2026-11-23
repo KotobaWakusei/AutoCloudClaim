@@ -27,7 +27,7 @@ object DexScan {
         val ret: String
     )
 
-    /** 遍历 APK 里的每个 classes*.dex。 */
+    /** 遍历 APK 里的每个 classes*.dex。解析失败按 dex 记日志，不再全静默。 */
     private inline fun forEachDex(apkPath: String, action: (Dex) -> Unit) {
         var zf: ZipFile? = null
         try {
@@ -40,36 +40,82 @@ object DexScan {
                 try {
                     action(Dex(bytes))
                 } catch (t: Throwable) {
-                    // 单个 dex 解析失败不影响其它
+                    // 单个 dex 解析失败不影响其它，但必须留痕：排查「签名没扫到」时
+                    // 全静默会让人分不清是 dex 坏了还是根本没匹配。
+                    android.util.Log.w("AutoCloudDexScan", "dex parse failed: " + e.name, t)
                 }
             }
         } catch (t: Throwable) {
-            // APK 读不到就当没发现
+            android.util.Log.w("AutoCloudDexScan", "apk unreadable: $apkPath", t)
         } finally {
             runCatching { zf?.close() }
         }
     }
 
-    /** 找出所有「参数与返回值符合条件」的方法。 */
+    /** 找出所有「参数与返回值符合条件」的方法（遍历 class_data，拿真实 access_flags）。 */
     fun findMethods(
         apkPath: String,
         predicate: (params: List<String>, ret: String) -> Boolean
     ): List<MethodRef> {
         val out = ArrayList<MethodRef>()
         forEachDex(apkPath) { d ->
-            for (i in 0 until d.methodIdsSize) {
-                val (classIdx, protoIdx, nameIdx, accessFlags) = d.methodId(i)
-                val (ret, params) = d.proto(protoIdx)
-                if (!predicate(params, ret)) continue
-                out.add(
-                    MethodRef(
-                        className = d.typeDescriptor(classIdx).toClassName(),
-                        methodName = d.string(nameIdx),
-                        isStatic = (accessFlags and 0x0008) != 0,
-                        params = params.map { it.toClassName() },
-                        ret = ret.toClassName()
+            for (i in 0 until d.classDefsSize) {
+                val cdOff = d.classDefsOff + 32 * i
+                val classIdx = d.u32(cdOff)
+                val classDataOff = d.u32(cdOff + 24)
+                if (classDataOff == 0) continue
+                val className = d.typeDescriptor(classIdx).toClassName()
+                var o = classDataOff
+                val (staticFieldsSize, o1) = d.uleb(o); o = o1
+                val (instanceFieldsSize, o2) = d.uleb(o); o = o2
+                val (directMethodsSize, o3) = d.uleb(o); o = o3
+                val (virtualMethodsSize, o4) = d.uleb(o); o = o4
+                // 字段：跳过（encoded_field: field_idx_diff, access_flags）
+                repeat(staticFieldsSize + instanceFieldsSize) {
+                    val (_, no) = d.uleb(o); o = no
+                    val (_, no2) = d.uleb(o); o = no2
+                }
+                // direct 与 virtual 各自独立累积 method_idx（DEX 规范 "in the list" 指各自列表）
+                var directAcc = 0
+                repeat(directMethodsSize) {
+                    val (diff, no) = d.uleb(o); o = no
+                    directAcc += diff
+                    val (accessFlags, no2) = d.uleb(o); o = no2
+                    val (codeOff, no3) = d.uleb(o); o = no3
+                    if (codeOff == 0) return@repeat
+                    val m = d.methodId(directAcc)
+                    val (ret, params) = d.proto(m.protoIdx)
+                    if (!predicate(params, ret)) return@repeat
+                    out.add(
+                        MethodRef(
+                            className = className,
+                            methodName = d.string(m.nameIdx),
+                            isStatic = (accessFlags and 0x0008) != 0,
+                            params = params.map { it.toClassName() },
+                            ret = ret.toClassName()
+                        )
                     )
-                )
+                }
+                var virtualAcc = 0
+                repeat(virtualMethodsSize) {
+                    val (diff, no) = d.uleb(o); o = no
+                    virtualAcc += diff
+                    val (accessFlags, no2) = d.uleb(o); o = no2
+                    val (codeOff, no3) = d.uleb(o); o = no3
+                    if (codeOff == 0) return@repeat
+                    val m = d.methodId(virtualAcc)
+                    val (ret, params) = d.proto(m.protoIdx)
+                    if (!predicate(params, ret)) return@repeat
+                    out.add(
+                        MethodRef(
+                            className = className,
+                            methodName = d.string(m.nameIdx),
+                            isStatic = (accessFlags and 0x0008) != 0,
+                            params = params.map { it.toClassName() },
+                            ret = ret.toClassName()
+                        )
+                    )
+                }
             }
         }
         return out
@@ -126,7 +172,7 @@ object DexScan {
         private val strCache = HashMap<Int, String>()
         private val typeCache = HashMap<Int, String>()
 
-        private fun u16(off: Int): Int = (b[off].toInt() and 0xFF) or
+        internal fun u16(off: Int): Int = (b[off].toInt() and 0xFF) or
             ((b[off + 1].toInt() and 0xFF) shl 8)
 
         private fun i32(off: Int): Int =
@@ -135,10 +181,10 @@ object DexScan {
                 ((b[off + 2].toInt() and 0xFF) shl 16) or
                 ((b[off + 3].toInt() and 0xFF) shl 24)
 
-        private fun u32(off: Int): Int = i32(off)
+        internal fun u32(off: Int): Int = i32(off)
 
         /** uleb128 解码，返回值与结束偏移。 */
-        private fun uleb(off: Int): Pair<Int, Int> {
+        internal fun uleb(off: Int): Pair<Int, Int> {
             var result = 0
             var shift = 0
             var o = off
@@ -185,17 +231,16 @@ object DexScan {
             return typeDescriptor(retIdx) to params
         }
 
-        /** method_id_item -> (class_type_idx, proto_idx, name_idx, access_flags) */
-        fun methodId(idx: Int): Quad {
+        /** method_id_item -> (class_type_idx, proto_idx, name_idx)。DEX 规范：method_id_item 仅 8 字节，无 access_flags 字段。 */
+        fun methodId(idx: Int): Triple {
             val off = methodIdsOff + 8 * idx
-            return Quad(u16(off), u16(off + 2), u32(off + 4), u16(off + 6))
+            return Triple(u16(off), u16(off + 2), u32(off + 4))
         }
 
-        data class Quad(
+        data class Triple(
             val classIdx: Int,
             val protoIdx: Int,
-            val nameIdx: Int,
-            val accessFlags: Int
+            val nameIdx: Int
         )
 
         /** 找字符串常量下标（没有则 null）。 */
@@ -228,15 +273,17 @@ object DexScan {
                     val (_, no) = uleb(o); o = no
                     val (_, no2) = uleb(o); o = no2
                 }
-                var methodIdxAcc = 0
+                var directAcc = 0
+                var virtualAcc = 0
                 repeat(directMethodsSize + virtualMethodsSize) { mi ->
                     val (diff, no) = uleb(o); o = no
-                    methodIdxAcc = if (mi < directMethodsSize) diff else methodIdxAcc + diff
+                    if (mi < directMethodsSize) directAcc += diff else virtualAcc += diff
+                    val idx = if (mi < directMethodsSize) directAcc else virtualAcc
                     val (accessFlags, no2) = uleb(o); o = no2
                     val (codeOff, no3) = uleb(o); o = no3
                     if (codeOff == 0) return@repeat
                     if (!codeReferencesString(codeOff, target)) return@repeat
-                    val m = methodId(methodIdxAcc)
+                    val m = methodId(idx)
                     val (ret, params) = proto(m.protoIdx)
                     out.add(
                         MethodRef(
